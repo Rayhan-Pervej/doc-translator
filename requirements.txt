@@ -1,0 +1,8 @@
+pymupdf
+pymupdf-fonts
+python-docx
+docx2python
+openpyxl
+boto3
+charset-normalizer
+python-dotenv
