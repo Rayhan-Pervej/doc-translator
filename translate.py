@@ -128,7 +128,7 @@ def _translate_drawing_xml(xml_bytes: bytes, context: str) -> bytes:
     except ET.ParseError:
         return xml_bytes
 
-    nodes = [el for el in root.iter(tag) if el.text and el.text.strip()]
+    nodes = [el for el in root.iter(tag) if el.text and el.text.strip() and _has_japanese(el.text)]
     if not nodes:
         return xml_bytes
 
@@ -158,9 +158,13 @@ def _translate_drawing_xml(xml_bytes: bytes, context: str) -> bytes:
     return out.encode("utf-8")
 
 
+def _has_japanese(text: str) -> bool:
+    return any(0x3000 <= ord(c) <= 0x9FFF or 0xF900 <= ord(c) <= 0xFAFF for c in text)
+
+
 def _batch_translate_xml_texts(texts: list[str], context: str) -> dict[str, str]:
     """Batch translate a list of unique strings, return {original: translated}."""
-    unique = list(dict.fromkeys(t for t in texts if t.strip()))
+    unique = list(dict.fromkeys(t for t in texts if t.strip() and _has_japanese(t)))
     if not unique:
         return {}
     numbered = "\n".join(f"[{i+1}] {t}" for i, t in enumerate(unique))
@@ -188,38 +192,100 @@ def _batch_translate_xml_texts(texts: list[str], context: str) -> dict[str, str]
 
 
 def _translate_shared_strings(xml_bytes: bytes, context: str) -> bytes:
-    """Translate all <t> text nodes in sharedStrings.xml in one batch call."""
-    import re
-    texts = re.findall(r'<t(?:\s[^>]*)?>([^<]+)</t>', xml_bytes.decode("utf-8"))
-    if not texts:
+    """
+    Translate sharedStrings.xml handling both plain and rich-text entries.
+    Plain <si><t>text</t></si>: translate the single text node.
+    Rich <si><r><t>A</t></r><r><t>B</t></r></si>: join all runs → translate as one →
+      put result in first run's <t>, clear the rest (preserves formatting of first run).
+    """
+    import re, xml.etree.ElementTree as ET, io
+
+    NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    si_tag = f"{{{NS}}}si"
+    r_tag  = f"{{{NS}}}r"
+    t_tag  = f"{{{NS}}}t"
+
+    try:
+        root = ET.fromstring(xml_bytes)
+    except ET.ParseError:
         return xml_bytes
-    tmap = _batch_translate_xml_texts(texts, context)
-    def replacer(m):
-        full, inner = m.group(0), m.group(1)
-        return full.replace(inner, tmap.get(inner, inner), 1)
-    result = re.sub(r'<t(?:\s[^>]*)?>([^<]+)</t>', replacer, xml_bytes.decode("utf-8"))
-    return result.encode("utf-8")
+
+    # Collect texts to translate: map id → (si_element, mode, text)
+    to_translate: list[tuple] = []  # (si_el, is_rich, joined_text, [t_elements])
+
+    for si in root.iter(si_tag):
+        runs = list(si.iter(r_tag))
+        t_nodes = list(si.iter(t_tag))
+
+        if len(runs) > 1:
+            # Rich text — join all run texts
+            joined = "".join((el.text or "") for el in t_nodes)
+            if joined.strip() and _has_japanese(joined):
+                to_translate.append((si, True, joined, t_nodes))
+        elif t_nodes:
+            text = t_nodes[0].text or ""
+            if text.strip() and _has_japanese(text):
+                to_translate.append((si, False, text, t_nodes))
+
+    if not to_translate:
+        return xml_bytes
+
+    unique = list(dict.fromkeys(item[2] for item in to_translate))
+    tmap = _batch_translate_xml_texts(unique, context)
+
+    for si, is_rich, original, t_nodes in to_translate:
+        translated = tmap.get(original, original)
+        if is_rich:
+            # Put full translation in first <t>, blank out the rest
+            t_nodes[0].text = translated
+            for t in t_nodes[1:]:
+                t.text = ""
+        else:
+            t_nodes[0].text = translated
+
+    for event, elem in ET.iterparse(io.BytesIO(xml_bytes), events=["start-ns"]):
+        ET.register_namespace(elem[0], elem[1])
+
+    out = ET.tostring(root, encoding="unicode", xml_declaration=False)
+    orig_str = xml_bytes.decode("utf-8")
+    if orig_str.startswith("<?xml"):
+        decl = orig_str[:orig_str.index("?>") + 2]
+        out = decl + "\n" + out
+    return out.encode("utf-8")
 
 
 def _translate_sheet_xml(xml_bytes: bytes, context: str) -> bytes:
-    """Translate inline <t> strings in a worksheet XML (for non-shared-string cells)."""
+    """Translate inline strings and cached formula string values in a worksheet XML."""
     import re
-    # Only inline strings <is><t>...</t></is>, not shared string indices
-    texts = re.findall(r'(<is><t>)(.*?)(</t></is>)', xml_bytes.decode("utf-8"), re.DOTALL)
-    if not texts:
+    text = xml_bytes.decode("utf-8")
+
+    # 1. Inline strings: <is><t>...</t></is>
+    inline = re.findall(r'(<is><t>)(.*?)(</t></is>)', text, re.DOTALL)
+    inline_unique = [t[1] for t in inline if t[1].strip()]
+
+    # 2. Cached formula string results: <c ... t="str"><f ...>...</f><v>CACHED</v></c>
+    cached = re.findall(r'(<c [^>]*t="str"[^>]*>(?:<f[^>]*>[^<]*</f>)?<v>)([^<]+)(</v>)', text)
+    cached_unique = [t[1] for t in cached if t[1].strip()]
+
+    all_unique = list(dict.fromkeys(inline_unique + cached_unique))
+    if not all_unique:
         return xml_bytes
-    unique = [t[1] for t in texts if t[1].strip()]
-    if not unique:
-        return xml_bytes
-    tmap = _batch_translate_xml_texts(unique, context)
-    def replacer(m):
+
+    tmap = _batch_translate_xml_texts(all_unique, context)
+
+    def replace_inline(m):
         return m.group(1) + tmap.get(m.group(2), m.group(2)) + m.group(3)
-    result = re.sub(r'(<is><t>)(.*?)(</t></is>)', replacer, xml_bytes.decode("utf-8"), flags=re.DOTALL)
-    return result.encode("utf-8")
+
+    def replace_cached(m):
+        return m.group(1) + tmap.get(m.group(2), m.group(2)) + m.group(3)
+
+    text = re.sub(r'(<is><t>)(.*?)(</t></is>)', replace_inline, text, flags=re.DOTALL)
+    text = re.sub(r'(<c [^>]*t="str"[^>]*>(?:<f[^>]*>[^<]*</f>)?<v>)([^<]+)(</v>)', replace_cached, text)
+    return text.encode("utf-8")
 
 
-def _translate_workbook_xml(xml_bytes: bytes, context: str) -> bytes:
-    """Translate only <sheet> tab names inside workbook.xml using XML parser."""
+def _translate_workbook_xml(xml_bytes: bytes, context: str) -> tuple[bytes, dict[str, str]]:
+    """Translate <sheet> tab names. Returns (new_xml, {japanese_name: english_name}) map."""
     import xml.etree.ElementTree as ET
     import io
 
@@ -229,11 +295,11 @@ def _translate_workbook_xml(xml_bytes: bytes, context: str) -> bytes:
     try:
         root = ET.fromstring(xml_bytes)
     except ET.ParseError:
-        return xml_bytes
+        return xml_bytes, {}
 
-    sheets = [el for el in root.iter(tag) if el.get("name")]
+    sheets = [el for el in root.iter(tag) if el.get("name") and _has_japanese(el.get("name"))]
     if not sheets:
-        return xml_bytes
+        return xml_bytes, {}
 
     unique = list(dict.fromkeys(el.get("name") for el in sheets))
     tmap = _batch_translate_xml_texts(unique, context)
@@ -249,7 +315,20 @@ def _translate_workbook_xml(xml_bytes: bytes, context: str) -> bytes:
     if orig_str.startswith("<?xml"):
         decl = orig_str[:orig_str.index("?>") + 2]
         out = decl + "\n" + out
-    return out.encode("utf-8")
+    return out.encode("utf-8"), tmap
+
+
+def _patch_formula_sheet_refs(xml_bytes: bytes, sheet_name_map: dict[str, str]) -> bytes:
+    """Replace Japanese sheet name references in formulas, e.g. '変更履歴'!A1 → 'Change History'!A1"""
+    if not sheet_name_map:
+        return xml_bytes
+    text = xml_bytes.decode("utf-8")
+    for jp, en in sheet_name_map.items():
+        # quoted: 'シート名'! → 'Sheet Name'!
+        text = text.replace(f"'{jp}'!", f"'{en}'!")
+        # unquoted: シート名! → 'Sheet Name'! (add quotes since English name may have spaces)
+        text = text.replace(f"{jp}!", f"'{en}'!")
+    return text.encode("utf-8")
 
 
 def _set_fonts_arial_styles(xml_bytes: bytes) -> bytes:
@@ -296,43 +375,81 @@ def _set_fonts_arial_shared_strings(xml_bytes: bytes) -> bytes:
     return out.encode("utf-8")
 
 
+def _translate_docprops_app(xml_bytes: bytes, sheet_name_map: dict[str, str]) -> bytes:
+    """Patch sheet names in docProps/app.xml using the already-translated sheet name map."""
+    import re
+    text = xml_bytes.decode("utf-8")
+    for jp, en in sheet_name_map.items():
+        text = text.replace(f">{jp}<", f">{en}<")
+    return text.encode("utf-8")
+
+
 def translate_xlsx(src: Path, dst: Path, context: str):
     import zipfile
 
     dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_suffix(".tmp.xlsx")
 
-    # Pure ZIP/XML approach — never use openpyxl to save, so drawings/images/rels are preserved exactly
-    with zipfile.ZipFile(src, "r") as zin, zipfile.ZipFile(dst, "w", zipfile.ZIP_DEFLATED) as zout:
-        for item in zin.infolist():
-            fname = item.filename
-            data = zin.read(fname)
+    # Write to a temp file first — rename to dst only on full success, so a crash never corrupts output
+    try:
+        # First pass: read all data and build sheet name map from workbook.xml
+        sheet_name_map: dict[str, str] = {}
+        all_items: list[tuple] = []
+        with zipfile.ZipFile(src, "r") as zin:
+            for item in zin.infolist():
+                data = zin.read(item.filename)
+                all_items.append((item, data))
 
-            if fname == "xl/sharedStrings.xml":
-                print(f"    Translating shared strings...")
-                data = _translate_shared_strings(data, context)
-                data = _set_fonts_arial_shared_strings(data)
-
-            elif fname == "xl/workbook.xml":
+        # Translate workbook.xml first to get the sheet name map
+        for item, data in all_items:
+            if item.filename == "xl/workbook.xml":
                 print(f"    Translating sheet tab names...")
-                data = _translate_workbook_xml(data, context)
+                translated, sheet_name_map = _translate_workbook_xml(data, context)
+                break
 
-            elif fname == "xl/styles.xml":
-                print(f"    Setting fonts to Arial in styles...")
-                data = _set_fonts_arial_styles(data)
+        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zout:
+            for item, data in all_items:
+                fname = item.filename
 
-            elif fname.startswith("xl/worksheets/") and fname.endswith(".xml"):
-                print(f"    Translating worksheet: {fname}")
-                data = _translate_sheet_xml(data, context)
+                if fname == "xl/sharedStrings.xml":
+                    print(f"    Translating shared strings...")
+                    data = _translate_shared_strings(data, context)
+                    data = _set_fonts_arial_shared_strings(data)
 
-            elif (
-                fname.startswith("xl/drawings/")
-                and fname.endswith(".xml")
-                and not fname.endswith(".rels")
-            ):
-                print(f"    Translating drawing: {fname}")
-                data = _translate_drawing_xml(data, context)
+                elif fname == "xl/workbook.xml":
+                    data = translated  # already done above
 
-            zout.writestr(item, data)
+                elif fname == "xl/styles.xml":
+                    print(f"    Setting fonts to Arial in styles...")
+                    data = _set_fonts_arial_styles(data)
+
+                elif fname.startswith("xl/worksheets/") and fname.endswith(".xml"):
+                    print(f"    Translating worksheet: {fname}")
+                    data = _translate_sheet_xml(data, context)
+                    data = _patch_formula_sheet_refs(data, sheet_name_map)
+
+                elif (
+                    fname.startswith("xl/drawings/")
+                    and fname.endswith(".xml")
+                    and not fname.endswith(".rels")
+                ):
+                    print(f"    Translating drawing: {fname}")
+                    data = _translate_drawing_xml(data, context)
+
+                elif fname == "docProps/app.xml":
+                    data = _translate_docprops_app(data, sheet_name_map)
+
+                zout.writestr(item, data)
+
+        # All done — move temp to final destination
+        if dst.exists():
+            dst.unlink()
+        tmp.rename(dst)
+
+    except Exception:
+        if tmp.exists():
+            tmp.unlink()
+        raise
 
 
 def _sample_bg(pix, bbox, scale):
