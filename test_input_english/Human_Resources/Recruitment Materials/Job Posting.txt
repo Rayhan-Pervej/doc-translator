@@ -1,6 +1,0 @@
-Job Posting
-
-Position: Software Engineer
-Location: Shibuya-ku, Tokyo
-Salary: Monthly salary of 300,000 yen or above
-Qualifications: 3+ years of experience with Python

@@ -116,19 +116,169 @@ def translate_docx(src: Path, dst: Path, context: str):
     doc.save(str(dst))
 
 
+def _translate_drawing_xml(xml_bytes: bytes, context: str) -> bytes:
+    """Translate Japanese text inside <a:t> nodes using XML parser to avoid regex truncation."""
+    import xml.etree.ElementTree as ET
+
+    NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
+    tag = f"{{{NS}}}t"
+
+    try:
+        root = ET.fromstring(xml_bytes)
+    except ET.ParseError:
+        return xml_bytes
+
+    nodes = [el for el in root.iter(tag) if el.text and el.text.strip()]
+    if not nodes:
+        return xml_bytes
+
+    unique = list(dict.fromkeys(el.text for el in nodes))
+    tmap = _batch_translate_xml_texts(unique, context)
+
+    for el in nodes:
+        el.text = tmap.get(el.text, el.text)
+
+    # Re-serialize preserving the original XML declaration and namespaces
+    ET.register_namespace("a", NS)
+    # Collect all namespaces from original to re-register them
+    for event, elem in ET.iterparse(__import__("io").BytesIO(xml_bytes), events=["start-ns"]):
+        ET.register_namespace(elem[0], elem[1])
+
+    out = ET.tostring(root, encoding="unicode", xml_declaration=False)
+    # Prepend original XML declaration if present
+    orig_str = xml_bytes.decode("utf-8")
+    if orig_str.startswith("<?xml"):
+        decl = orig_str[:orig_str.index("?>") + 2]
+        out = decl + "\n" + out
+    return out.encode("utf-8")
+
+
+def _batch_translate_xml_texts(texts: list[str], context: str) -> dict[str, str]:
+    """Batch translate a list of unique strings, return {original: translated}."""
+    unique = list(dict.fromkeys(t for t in texts if t.strip()))
+    if not unique:
+        return {}
+    numbered = "\n".join(f"[{i+1}] {t}" for i, t in enumerate(unique))
+    batch_prompt = (
+        f"Translate the Japanese portions of each numbered text segment to English.\n"
+        f"Return ONLY the translations, one per line, keeping the same [N] numbering.\n"
+        f"Rules:\n"
+        f"- Translate ONLY Japanese text. Leave English, numbers, symbols, and formulas unchanged.\n"
+        f"- Do NOT add notes or extra text.\n\n"
+        f"Context: {context}\n\n"
+        f"{numbered}"
+    )
+    raw = translate(batch_prompt, context="")
+    result: dict[str, str] = {}
+    for ln in raw.splitlines():
+        ln = ln.strip()
+        if ln.startswith("[") and "]" in ln:
+            try:
+                idx = int(ln[1:ln.index("]")])
+                val = ln[ln.index("]") + 1:].strip()
+                result[unique[idx - 1]] = val
+            except (ValueError, IndexError):
+                pass
+    return result
+
+
+def _translate_shared_strings(xml_bytes: bytes, context: str) -> bytes:
+    """Translate all <t> text nodes in sharedStrings.xml in one batch call."""
+    import re
+    texts = re.findall(r'<t(?:\s[^>]*)?>([^<]+)</t>', xml_bytes.decode("utf-8"))
+    if not texts:
+        return xml_bytes
+    tmap = _batch_translate_xml_texts(texts, context)
+    def replacer(m):
+        full, inner = m.group(0), m.group(1)
+        return full.replace(inner, tmap.get(inner, inner), 1)
+    result = re.sub(r'<t(?:\s[^>]*)?>([^<]+)</t>', replacer, xml_bytes.decode("utf-8"))
+    return result.encode("utf-8")
+
+
+def _translate_sheet_xml(xml_bytes: bytes, context: str) -> bytes:
+    """Translate inline <t> strings in a worksheet XML (for non-shared-string cells)."""
+    import re
+    # Only inline strings <is><t>...</t></is>, not shared string indices
+    texts = re.findall(r'(<is><t>)(.*?)(</t></is>)', xml_bytes.decode("utf-8"), re.DOTALL)
+    if not texts:
+        return xml_bytes
+    unique = [t[1] for t in texts if t[1].strip()]
+    if not unique:
+        return xml_bytes
+    tmap = _batch_translate_xml_texts(unique, context)
+    def replacer(m):
+        return m.group(1) + tmap.get(m.group(2), m.group(2)) + m.group(3)
+    result = re.sub(r'(<is><t>)(.*?)(</t></is>)', replacer, xml_bytes.decode("utf-8"), flags=re.DOTALL)
+    return result.encode("utf-8")
+
+
+def _translate_workbook_xml(xml_bytes: bytes, context: str) -> bytes:
+    """Translate only <sheet> tab names inside workbook.xml using XML parser."""
+    import xml.etree.ElementTree as ET
+    import io
+
+    NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    tag = f"{{{NS}}}sheet"
+
+    try:
+        root = ET.fromstring(xml_bytes)
+    except ET.ParseError:
+        return xml_bytes
+
+    sheets = [el for el in root.iter(tag) if el.get("name")]
+    if not sheets:
+        return xml_bytes
+
+    unique = list(dict.fromkeys(el.get("name") for el in sheets))
+    tmap = _batch_translate_xml_texts(unique, context)
+
+    for el in sheets:
+        el.set("name", tmap.get(el.get("name"), el.get("name")))
+
+    for event, elem in ET.iterparse(io.BytesIO(xml_bytes), events=["start-ns"]):
+        ET.register_namespace(elem[0], elem[1])
+
+    out = ET.tostring(root, encoding="unicode", xml_declaration=False)
+    orig_str = xml_bytes.decode("utf-8")
+    if orig_str.startswith("<?xml"):
+        decl = orig_str[:orig_str.index("?>") + 2]
+        out = decl + "\n" + out
+    return out.encode("utf-8")
+
+
 def translate_xlsx(src: Path, dst: Path, context: str):
-    import openpyxl
-
-    wb = openpyxl.load_workbook(str(src))
-
-    for ws in wb.worksheets:
-        for row in ws.iter_rows():
-            for cell in row:
-                if isinstance(cell.value, str) and cell.value.strip():
-                    cell.value = translate(cell.value, context=context)
+    import zipfile
 
     dst.parent.mkdir(parents=True, exist_ok=True)
-    wb.save(str(dst))
+
+    # Pure ZIP/XML approach — never use openpyxl to save, so drawings/images/rels are preserved exactly
+    with zipfile.ZipFile(src, "r") as zin, zipfile.ZipFile(dst, "w", zipfile.ZIP_DEFLATED) as zout:
+        for item in zin.infolist():
+            fname = item.filename
+            data = zin.read(fname)
+
+            if fname == "xl/sharedStrings.xml":
+                print(f"    Translating shared strings...")
+                data = _translate_shared_strings(data, context)
+
+            elif fname == "xl/workbook.xml":
+                print(f"    Translating sheet tab names...")
+                data = _translate_workbook_xml(data, context)
+
+            elif fname.startswith("xl/worksheets/") and fname.endswith(".xml"):
+                print(f"    Translating worksheet: {fname}")
+                data = _translate_sheet_xml(data, context)
+
+            elif (
+                fname.startswith("xl/drawings/")
+                and fname.endswith(".xml")
+                and not fname.endswith(".rels")
+            ):
+                print(f"    Translating drawing: {fname}")
+                data = _translate_drawing_xml(data, context)
+
+            zout.writestr(item, data)
 
 
 def _sample_bg(pix, bbox, scale):
@@ -419,9 +569,6 @@ if __name__ == "__main__":
 
     src = Path(os.fsdecode(sys.argv[1].strip('"').strip("'"))).resolve()
 
-    # Output is always a sibling of the input folder, named <folder>_english
-    dst = src.parent / (src.name + "_english")
-
     max_pages = None
     if "--pages" in sys.argv:
         idx = sys.argv.index("--pages")
@@ -429,12 +576,32 @@ if __name__ == "__main__":
         print(f"PDF page limit: {max_pages}")
 
     if not src.exists():
-        print(f"Error: input folder not found: {src}")
+        print(f"Error: input not found: {src}")
         sys.exit(1)
 
-    if not src.is_dir():
-        print(f"Error: input path is not a folder: {src}")
-        sys.exit(1)
+    # ── Single file mode ──────────────────────────────────────────────────────
+    if src.is_file():
+        stem = src.stem
+        ext = src.suffix
+        translated_stem = translate_name(stem, context=f"file in folder: {src.parent.name}")
+        dst_dir = src.parent.parent / (src.parent.name + "_english")
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        dst_file = dst_dir / (translated_stem + ext)
+        print(f"Source:  {src}")
+        print(f"Output:  {dst_file}")
+        if dst_file.exists():
+            answer = input("Output file already exists. Overwrite? (y/n): ").strip().lower()
+            if answer != "y":
+                print("Aborted.")
+                sys.exit(0)
+        context = f"Document '{translated_stem + ext}' in folder '{src.parent.name}'"
+        process_file(src, dst_file, context, max_pages=max_pages)
+        print("\n── Done ──")
+        print(f"Output: {dst_file}")
+        sys.exit(0)
+
+    # ── Folder mode ───────────────────────────────────────────────────────────
+    dst = src.parent / (src.name + "_english")
 
     if dst.exists():
         print(f"Warning: output folder already exists: {dst}")
