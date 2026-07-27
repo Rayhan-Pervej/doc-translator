@@ -138,6 +138,11 @@ def _translate_drawing_xml(xml_bytes: bytes, context: str) -> bytes:
     for el in nodes:
         el.text = tmap.get(el.text, el.text)
 
+    # Set all fonts to Arial
+    for font_tag in ("latin", "ea", "cs"):
+        for el in root.iter(f"{{{NS}}}{font_tag}"):
+            el.set("typeface", "Arial")
+
     # Re-serialize preserving the original XML declaration and namespaces
     ET.register_namespace("a", NS)
     # Collect all namespaces from original to re-register them
@@ -247,6 +252,50 @@ def _translate_workbook_xml(xml_bytes: bytes, context: str) -> bytes:
     return out.encode("utf-8")
 
 
+def _set_fonts_arial_styles(xml_bytes: bytes) -> bytes:
+    """Set all font names in styles.xml to Arial."""
+    import xml.etree.ElementTree as ET, io
+    NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    try:
+        root = ET.fromstring(xml_bytes)
+    except ET.ParseError:
+        return xml_bytes
+    for tag in (f"{{{NS}}}name", f"{{{NS}}}scheme"):
+        for el in root.iter(tag):
+            # <name val="MS PGothic"/> → <name val="Arial"/>
+            if el.get("val") and tag.endswith("}name"):
+                el.set("val", "Arial")
+    # Also patch <scheme val="..."/> to remove East-Asian font binding
+    for el in root.iter(f"{{{NS}}}scheme"):
+        el.set("val", "none")
+    for event, elem in ET.iterparse(io.BytesIO(xml_bytes), events=["start-ns"]):
+        ET.register_namespace(elem[0], elem[1])
+    out = ET.tostring(root, encoding="unicode", xml_declaration=False)
+    orig = xml_bytes.decode("utf-8")
+    if orig.startswith("<?xml"):
+        out = orig[:orig.index("?>") + 2] + "\n" + out
+    return out.encode("utf-8")
+
+
+def _set_fonts_arial_shared_strings(xml_bytes: bytes) -> bytes:
+    """Set all font names in sharedStrings.xml rich-text runs to Arial."""
+    import xml.etree.ElementTree as ET, io
+    NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    try:
+        root = ET.fromstring(xml_bytes)
+    except ET.ParseError:
+        return xml_bytes
+    for el in root.iter(f"{{{NS}}}rFont"):
+        el.set("val", "Arial")
+    for event, elem in ET.iterparse(io.BytesIO(xml_bytes), events=["start-ns"]):
+        ET.register_namespace(elem[0], elem[1])
+    out = ET.tostring(root, encoding="unicode", xml_declaration=False)
+    orig = xml_bytes.decode("utf-8")
+    if orig.startswith("<?xml"):
+        out = orig[:orig.index("?>") + 2] + "\n" + out
+    return out.encode("utf-8")
+
+
 def translate_xlsx(src: Path, dst: Path, context: str):
     import zipfile
 
@@ -261,10 +310,15 @@ def translate_xlsx(src: Path, dst: Path, context: str):
             if fname == "xl/sharedStrings.xml":
                 print(f"    Translating shared strings...")
                 data = _translate_shared_strings(data, context)
+                data = _set_fonts_arial_shared_strings(data)
 
             elif fname == "xl/workbook.xml":
                 print(f"    Translating sheet tab names...")
                 data = _translate_workbook_xml(data, context)
+
+            elif fname == "xl/styles.xml":
+                print(f"    Setting fonts to Arial in styles...")
+                data = _set_fonts_arial_styles(data)
 
             elif fname.startswith("xl/worksheets/") and fname.endswith(".xml"):
                 print(f"    Translating worksheet: {fname}")
