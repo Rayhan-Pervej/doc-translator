@@ -57,11 +57,25 @@ python3 -m venv venv
 source venv/bin/activate
 ```
 
+Once activated, your terminal prompt will show `(venv)` at the start:
+```
+(venv) PS D:\Projects\doc-translator>
+```
+
+> **Note:** You must activate the venv every time you open a new terminal before running the tool. To deactivate, run `deactivate`.
+
 ### 3. Install dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
+
+To verify everything installed correctly:
+```bash
+pip list
+```
+
+You should see packages like `boto3`, `python-docx`, `openpyxl`, `pymupdf`, `charset-normalizer` in the list.
 
 ### 4. Configure AWS credentials
 
