@@ -117,45 +117,28 @@ def translate_docx(src: Path, dst: Path, context: str):
 
 
 def _translate_drawing_xml(xml_bytes: bytes, context: str) -> bytes:
-    """Translate Japanese text inside <a:t> nodes using XML parser to avoid regex truncation."""
-    import xml.etree.ElementTree as ET
+    """Translate <a:t> text and set fonts to Arial using regex — no ET serialization to avoid namespace pollution."""
+    import re
 
-    NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
-    tag = f"{{{NS}}}t"
+    text = xml_bytes.decode("utf-8")
 
-    try:
-        root = ET.fromstring(xml_bytes)
-    except ET.ParseError:
-        return xml_bytes
+    # Collect unique Japanese <a:t> values
+    all_t = re.findall(r'(<a:t[^>]*>)([^<]*)(</a:t>)', text)
+    unique = list(dict.fromkeys(t[1] for t in all_t if t[1].strip() and _has_japanese(t[1])))
+    if unique:
+        tmap = _batch_translate_xml_texts(unique, context)
+        def replace_t(m):
+            orig = m.group(2)
+            xlated = tmap.get(orig, orig)
+            return m.group(1) + _xml_escape(xlated) + m.group(3)
+        text = re.sub(r'(<a:t[^>]*>)([^<]*)(</a:t>)', replace_t, text)
 
-    nodes = [el for el in root.iter(tag) if el.text and el.text.strip() and _has_japanese(el.text)]
-    if not nodes:
-        return xml_bytes
+    # Set all latin/ea/cs fonts to Arial
+    text = re.sub(r'(<a:latin\b[^>]*\btypeface=")[^"]*(")', r'\1Arial\2', text)
+    text = re.sub(r'(<a:ea\b[^>]*\btypeface=")[^"]*(")', r'\1Arial\2', text)
+    text = re.sub(r'(<a:cs\b[^>]*\btypeface=")[^"]*(")', r'\1Arial\2', text)
 
-    unique = list(dict.fromkeys(el.text for el in nodes))
-    tmap = _batch_translate_xml_texts(unique, context)
-
-    for el in nodes:
-        el.text = tmap.get(el.text, el.text)
-
-    # Set all fonts to Arial
-    for font_tag in ("latin", "ea", "cs"):
-        for el in root.iter(f"{{{NS}}}{font_tag}"):
-            el.set("typeface", "Arial")
-
-    # Re-serialize preserving the original XML declaration and namespaces
-    ET.register_namespace("a", NS)
-    # Collect all namespaces from original to re-register them
-    for event, elem in ET.iterparse(__import__("io").BytesIO(xml_bytes), events=["start-ns"]):
-        ET.register_namespace(elem[0], elem[1])
-
-    out = ET.tostring(root, encoding="unicode", xml_declaration=False)
-    # Prepend original XML declaration if present
-    orig_str = xml_bytes.decode("utf-8")
-    if orig_str.startswith("<?xml"):
-        decl = orig_str[:orig_str.index("?>") + 2]
-        out = decl + "\n" + out
-    return out.encode("utf-8")
+    return text.encode("utf-8")
 
 
 def _has_japanese(text: str) -> bool:
@@ -191,67 +174,113 @@ def _batch_translate_xml_texts(texts: list[str], context: str) -> dict[str, str]
     return result
 
 
+def _xml_escape(s: str) -> str:
+    """Escape special XML characters in text content."""
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _xml_unescape(s: str) -> str:
+    """Unescape XML entities back to plain text for translation."""
+    return s.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", '"').replace("&apos;", "'")
+
+
 def _translate_shared_strings(xml_bytes: bytes, context: str) -> bytes:
     """
-    Translate sharedStrings.xml handling both plain and rich-text entries.
-    Plain <si><t>text</t></si>: translate the single text node.
-    Rich <si><r><t>A</t></r><r><t>B</t></r></si>: join all runs → translate as one →
-      put result in first run's <t>, clear the rest (preserves formatting of first run).
+    Translate sharedStrings.xml using pure regex — no ElementTree serialization,
+    so the original XML structure, namespaces, and line endings are preserved exactly.
+
+    Plain <si><t>TEXT</t></si>: replace TEXT.
+    Rich <si>...<r><t>A</t></r><r><t>B</t></r>...</si>: join all <t> texts within
+      each <si>, translate as one string, put result in first <t>, blank the rest.
     """
-    import re, xml.etree.ElementTree as ET, io
+    import re
 
-    NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
-    si_tag = f"{{{NS}}}si"
-    r_tag  = f"{{{NS}}}r"
-    t_tag  = f"{{{NS}}}t"
+    text = xml_bytes.decode("utf-8")
 
-    try:
-        root = ET.fromstring(xml_bytes)
-    except ET.ParseError:
+    # ── 1. Collect all <si>…</si> blocks with their positions ──────────────────
+    si_pattern = re.compile(r'<si>(.*?)</si>', re.DOTALL)
+    matches = list(si_pattern.finditer(text))
+
+    if not matches:
         return xml_bytes
 
-    # Collect texts to translate: map id → (si_element, mode, text)
-    to_translate: list[tuple] = []  # (si_el, is_rich, joined_text, [t_elements])
+    # ── 2. For each <si>, determine if plain or rich; collect text to translate ─
+    # plain: single <t>…</t> (may have xml:space attr)
+    # rich:  one or more <r>…<t>…</t>…</r> runs
+    plain_t = re.compile(r'<t(?:\s[^>]*)?>([^<]*)</t>')
+    run_pattern = re.compile(r'<r\b[^>]*>(.*?)</r>', re.DOTALL)
 
-    for si in root.iter(si_tag):
-        runs = list(si.iter(r_tag))
-        t_nodes = list(si.iter(t_tag))
+    entries = []  # (match, is_rich, raw_xml_text, plain_text)
+    for m in matches:
+        inner = m.group(1)
+        runs = run_pattern.findall(inner)
+        if runs:
+            # Rich text: join all <t> contents across all runs
+            all_t = plain_t.findall(inner)
+            raw = "".join(all_t)
+            plain = _xml_unescape(raw)
+            entries.append((m, True, raw, plain))
+        else:
+            t_match = plain_t.search(inner)
+            if t_match:
+                raw = t_match.group(1)
+                plain = _xml_unescape(raw)
+                entries.append((m, False, raw, plain))
 
-        if len(runs) > 1:
-            # Rich text — join all run texts
-            joined = "".join((el.text or "") for el in t_nodes)
-            if joined.strip() and _has_japanese(joined):
-                to_translate.append((si, True, joined, t_nodes))
-        elif t_nodes:
-            text = t_nodes[0].text or ""
-            if text.strip() and _has_japanese(text):
-                to_translate.append((si, False, text, t_nodes))
-
-    if not to_translate:
+    # ── 3. Batch translate unique Japanese strings (using unescaped plain text) ─
+    unique = list(dict.fromkeys(
+        e[3] for e in entries if e[3].strip() and _has_japanese(e[3])
+    ))
+    if not unique:
         return xml_bytes
 
-    unique = list(dict.fromkeys(item[2] for item in to_translate))
     tmap = _batch_translate_xml_texts(unique, context)
 
-    for si, is_rich, original, t_nodes in to_translate:
-        translated = tmap.get(original, original)
+    # ── 4. Rebuild the XML by replacing <si> blocks in reverse order ───────────
+    # Reverse order so positions don't shift as we replace
+    result = text
+    for m, is_rich, raw_xml, plain in reversed(entries):
+        translated_plain = tmap.get(plain, plain)
+        if translated_plain == plain:
+            continue  # nothing to change
+        # XML-escape the translation before inserting into XML
+        translated = _xml_escape(translated_plain)
+
+        inner = m.group(1)
+        start, end = m.start(), m.end()
+
         if is_rich:
-            # Put full translation in first <t>, blank out the rest
-            t_nodes[0].text = translated
-            for t in t_nodes[1:]:
-                t.text = ""
+            # Replace first <t>…</t> content with full translation, blank the rest
+            t_positions = list(plain_t.finditer(inner))
+            if not t_positions:
+                continue
+            new_inner = inner
+            # Process in reverse so offsets stay valid
+            for i, tp in enumerate(reversed(t_positions)):
+                new_text = translated if i == len(t_positions) - 1 else ""
+                new_inner = (
+                    new_inner[:tp.start(1)]
+                    + new_text
+                    + new_inner[tp.end(1):]
+                )
+            # Strip <rPh>…</rPh> and <phoneticPr …/> — their sb/eb offsets
+            # reference character positions in the original Japanese text; keeping
+            # them after translation causes Excel's "repair" warning because the
+            # offsets are now out of range for the translated English string.
+            new_inner = re.sub(r'<rPh\b[^>]*>.*?</rPh>', '', new_inner, flags=re.DOTALL)
+            new_inner = re.sub(r'<phoneticPr\b[^>]*/>', '', new_inner)
+            result = result[:start] + f"<si>{new_inner}</si>" + result[end:]
         else:
-            t_nodes[0].text = translated
+            # Plain: replace the single <t> content
+            tp = plain_t.search(inner)
+            if tp:
+                new_inner = inner[:tp.start(1)] + translated + inner[tp.end(1):]
+                # Strip phonetic runs — invalid after translation (offsets point to Japanese chars)
+                new_inner = re.sub(r'<rPh\b[^>]*>.*?</rPh>', '', new_inner, flags=re.DOTALL)
+                new_inner = re.sub(r'<phoneticPr\b[^>]*/>', '', new_inner)
+                result = result[:start] + f"<si>{new_inner}</si>" + result[end:]
 
-    for event, elem in ET.iterparse(io.BytesIO(xml_bytes), events=["start-ns"]):
-        ET.register_namespace(elem[0], elem[1])
-
-    out = ET.tostring(root, encoding="unicode", xml_declaration=False)
-    orig_str = xml_bytes.decode("utf-8")
-    if orig_str.startswith("<?xml"):
-        decl = orig_str[:orig_str.index("?>") + 2]
-        out = decl + "\n" + out
-    return out.encode("utf-8")
+    return result.encode("utf-8")
 
 
 def _translate_sheet_xml(xml_bytes: bytes, context: str) -> bytes:
@@ -274,10 +303,14 @@ def _translate_sheet_xml(xml_bytes: bytes, context: str) -> bytes:
     tmap = _batch_translate_xml_texts(all_unique, context)
 
     def replace_inline(m):
-        return m.group(1) + tmap.get(m.group(2), m.group(2)) + m.group(3)
+        orig = m.group(2)
+        xlated = tmap.get(_xml_unescape(orig), _xml_unescape(orig))
+        return m.group(1) + _xml_escape(xlated) + m.group(3)
 
     def replace_cached(m):
-        return m.group(1) + tmap.get(m.group(2), m.group(2)) + m.group(3)
+        orig = m.group(2)
+        xlated = tmap.get(_xml_unescape(orig), _xml_unescape(orig))
+        return m.group(1) + _xml_escape(xlated) + m.group(3)
 
     text = re.sub(r'(<is><t>)(.*?)(</t></is>)', replace_inline, text, flags=re.DOTALL)
     text = re.sub(r'(<c [^>]*t="str"[^>]*>(?:<f[^>]*>[^<]*</f>)?<v>)([^<]+)(</v>)', replace_cached, text)
@@ -285,37 +318,53 @@ def _translate_sheet_xml(xml_bytes: bytes, context: str) -> bytes:
 
 
 def _translate_workbook_xml(xml_bytes: bytes, context: str) -> tuple[bytes, dict[str, str]]:
-    """Translate <sheet> tab names. Returns (new_xml, {japanese_name: english_name}) map."""
-    import xml.etree.ElementTree as ET
-    import io
+    """Translate <sheet> tab names using regex to avoid ET rewriting namespaces."""
+    import re
 
-    NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
-    tag = f"{{{NS}}}sheet"
-
-    try:
-        root = ET.fromstring(xml_bytes)
-    except ET.ParseError:
+    # Extract all sheet name= attributes — only from <sheet ...> tags
+    names = re.findall(r'(<sheet\b[^>]*\bname=")([^"]+)(")', xml_bytes.decode("utf-8"))
+    jp_names = [n[1] for n in names if _has_japanese(n[1])]
+    if not jp_names:
         return xml_bytes, {}
 
-    sheets = [el for el in root.iter(tag) if el.get("name") and _has_japanese(el.get("name"))]
-    if not sheets:
-        return xml_bytes, {}
+    tmap = _batch_translate_xml_texts(jp_names, context)
 
-    unique = list(dict.fromkeys(el.get("name") for el in sheets))
-    tmap = _batch_translate_xml_texts(unique, context)
+    # Sanitize and deduplicate translated names in sheet order
+    # (process in original sheet order so dedup suffix is deterministic)
+    all_names = [n[1] for n in names]  # all sheet names in order (jp + non-jp)
+    seen: set[str] = set()
+    # Pre-populate seen with non-Japanese names that won't be translated
+    for n in all_names:
+        if not _has_japanese(n):
+            seen.add(n.lower())
 
-    for el in sheets:
-        el.set("name", tmap.get(el.get("name"), el.get("name")))
+    sanitized: dict[str, str] = {}
+    for n in all_names:
+        if n not in tmap:
+            continue
+        en = tmap[n]
+        # Excel sheet names cannot contain: \ / ? * [ ] :  and max 31 chars
+        for ch in r'\/?*[]':
+            en = en.replace(ch, "-")
+        en = en.replace(":", "-").strip()
+        en = en[:31].rstrip()
+        # Deduplicate: if name already used, append _2, _3, etc.
+        base = en
+        suffix = 2
+        while en.lower() in seen:
+            tag = f"_{suffix}"
+            en = base[:31 - len(tag)] + tag
+            suffix += 1
+        seen.add(en.lower())
+        sanitized[n] = en
+        tmap[n] = en  # keep tmap in sync for formula patching
 
-    for event, elem in ET.iterparse(io.BytesIO(xml_bytes), events=["start-ns"]):
-        ET.register_namespace(elem[0], elem[1])
+    text = xml_bytes.decode("utf-8")
+    for jp, en in sanitized.items():
+        en_attr = en.replace("&", "&amp;").replace('"', "&quot;")
+        text = text.replace(f'name="{jp}"', f'name="{en_attr}"')
 
-    out = ET.tostring(root, encoding="unicode", xml_declaration=False)
-    orig_str = xml_bytes.decode("utf-8")
-    if orig_str.startswith("<?xml"):
-        decl = orig_str[:orig_str.index("?>") + 2]
-        out = decl + "\n" + out
-    return out.encode("utf-8"), tmap
+    return text.encode("utf-8"), tmap
 
 
 def _patch_formula_sheet_refs(xml_bytes: bytes, sheet_name_map: dict[str, str]) -> bytes:
@@ -332,47 +381,22 @@ def _patch_formula_sheet_refs(xml_bytes: bytes, sheet_name_map: dict[str, str]) 
 
 
 def _set_fonts_arial_styles(xml_bytes: bytes) -> bytes:
-    """Set all font names in styles.xml to Arial."""
-    import xml.etree.ElementTree as ET, io
-    NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
-    try:
-        root = ET.fromstring(xml_bytes)
-    except ET.ParseError:
-        return xml_bytes
-    for tag in (f"{{{NS}}}name", f"{{{NS}}}scheme"):
-        for el in root.iter(tag):
-            # <name val="MS PGothic"/> → <name val="Arial"/>
-            if el.get("val") and tag.endswith("}name"):
-                el.set("val", "Arial")
-    # Also patch <scheme val="..."/> to remove East-Asian font binding
-    for el in root.iter(f"{{{NS}}}scheme"):
-        el.set("val", "none")
-    for event, elem in ET.iterparse(io.BytesIO(xml_bytes), events=["start-ns"]):
-        ET.register_namespace(elem[0], elem[1])
-    out = ET.tostring(root, encoding="unicode", xml_declaration=False)
-    orig = xml_bytes.decode("utf-8")
-    if orig.startswith("<?xml"):
-        out = orig[:orig.index("?>") + 2] + "\n" + out
-    return out.encode("utf-8")
+    """Set all font names in styles.xml to Arial using regex."""
+    import re
+    text = xml_bytes.decode("utf-8")
+    # <name val="MS PGothic"/> → <name val="Arial"/>
+    text = re.sub(r'(<name\b[^>]*\bval=")[^"]*(")', r'\1Arial\2', text)
+    # <scheme val="minor"/> → <scheme val="none"/>
+    text = re.sub(r'(<scheme\b[^>]*\bval=")[^"]*(")', r'\1none\2', text)
+    return text.encode("utf-8")
 
 
 def _set_fonts_arial_shared_strings(xml_bytes: bytes) -> bytes:
-    """Set all font names in sharedStrings.xml rich-text runs to Arial."""
-    import xml.etree.ElementTree as ET, io
-    NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
-    try:
-        root = ET.fromstring(xml_bytes)
-    except ET.ParseError:
-        return xml_bytes
-    for el in root.iter(f"{{{NS}}}rFont"):
-        el.set("val", "Arial")
-    for event, elem in ET.iterparse(io.BytesIO(xml_bytes), events=["start-ns"]):
-        ET.register_namespace(elem[0], elem[1])
-    out = ET.tostring(root, encoding="unicode", xml_declaration=False)
-    orig = xml_bytes.decode("utf-8")
-    if orig.startswith("<?xml"):
-        out = orig[:orig.index("?>") + 2] + "\n" + out
-    return out.encode("utf-8")
+    """Set all rFont values in sharedStrings.xml to Arial using regex."""
+    import re
+    text = xml_bytes.decode("utf-8")
+    text = re.sub(r'(<rFont\b[^>]*\bval=")[^"]*(")', r'\1Arial\2', text)
+    return text.encode("utf-8")
 
 
 def _translate_docprops_app(xml_bytes: bytes, sheet_name_map: dict[str, str]) -> bytes:
@@ -408,8 +432,9 @@ def translate_xlsx(src: Path, dst: Path, context: str):
                 break
 
         with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zout:
-            for item, data in all_items:
+            for item, orig_data in all_items:
                 fname = item.filename
+                data = orig_data
 
                 if fname == "xl/sharedStrings.xml":
                     print(f"    Translating shared strings...")
@@ -439,7 +464,14 @@ def translate_xlsx(src: Path, dst: Path, context: str):
                 elif fname == "docProps/app.xml":
                     data = _translate_docprops_app(data, sheet_name_map)
 
-                zout.writestr(item, data)
+                if data is orig_data:
+                    # Unchanged — write with original ZipInfo (preserves flag_bits, timestamps, etc.)
+                    zout.writestr(item, data)
+                else:
+                    # Changed — use a clean ZipInfo so flag_bits/sizes aren't stale
+                    new_info = zipfile.ZipInfo(fname)
+                    new_info.compress_type = zipfile.ZIP_DEFLATED
+                    zout.writestr(new_info, data)
 
         # All done — move temp to final destination
         if dst.exists():
