@@ -122,14 +122,17 @@ def _translate_drawing_xml(xml_bytes: bytes, context: str) -> bytes:
 
     text = xml_bytes.decode("utf-8")
 
-    # Collect unique Japanese <a:t> values
+    # Collect unique Japanese <a:t> values (unescape entities before translation)
     all_t = re.findall(r'(<a:t[^>]*>)([^<]*)(</a:t>)', text)
-    unique = list(dict.fromkeys(t[1] for t in all_t if t[1].strip() and _has_japanese(t[1])))
+    unique = list(dict.fromkeys(
+        _xml_unescape(t[1]) for t in all_t
+        if t[1].strip() and _has_japanese(_xml_unescape(t[1]))
+    ))
     if unique:
         tmap = _batch_translate_xml_texts(unique, context)
         def replace_t(m):
-            orig = m.group(2)
-            xlated = tmap.get(orig, orig)
+            plain = _xml_unescape(m.group(2))
+            xlated = tmap.get(plain, plain)
             return m.group(1) + _xml_escape(xlated) + m.group(3)
         text = re.sub(r'(<a:t[^>]*>)([^<]*)(</a:t>)', replace_t, text)
 
