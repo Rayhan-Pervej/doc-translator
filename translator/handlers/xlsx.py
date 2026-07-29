@@ -6,8 +6,6 @@ from ..common import has_japanese, jp_char_count, xml_escape, xml_unescape, batc
 from ..client import translate_name
 
 
-# ── Drawing XML ───────────────────────────────────────────────────────────────
-
 def _translate_drawing_xml(xml_bytes: bytes, context: str) -> bytes:
     text  = xml_bytes.decode("utf-8")
     t_pat = re.compile(r'(<\w+:t(?:\s[^>]*)?>)([^<]*)(</\w+:t>)')
@@ -24,14 +22,14 @@ def _translate_drawing_xml(xml_bytes: bytes, context: str) -> bytes:
             return m.group(1) + xml_escape(xlated) + m.group(3)
         text = t_pat.sub(replace_t, text)
 
+    # Switch all fonts to Arial so translated text renders correctly (Japanese fonts lack Latin glyphs)
     text = re.sub(r'(<\w+:latin\b[^>]*\btypeface=")[^"]*(")', r'\1Arial\2', text)
     text = re.sub(r'(<\w+:ea\b[^>]*\btypeface=")[^"]*(")',    r'\1Arial\2', text)
     text = re.sub(r'(<\w+:cs\b[^>]*\btypeface=")[^"]*(")',    r'\1Arial\2', text)
+    # noAutofit freezes the text box size; normAutofit lets it resize after translation
     text = re.sub(r'<(\w+:)noAutofit/>',                       r'<\1normAutofit/>', text)
     return text.encode("utf-8")
 
-
-# ── Shared strings XML ────────────────────────────────────────────────────────
 
 def _translate_shared_strings(xml_bytes: bytes, context: str) -> bytes:
     text       = xml_bytes.decode("utf-8")
@@ -46,10 +44,12 @@ def _translate_shared_strings(xml_bytes: bytes, context: str) -> bytes:
     for m in matches:
         inner = m.group(1)
         if run_pat.findall(inner):
+            # Rich text: multiple <r> runs — join all <t> values to form the full string
             all_t = plain_t.findall(inner)
             raw   = "".join(all_t)
             entries.append((m, True, raw, xml_unescape(raw)))
         else:
+            # Plain text: single <t> element
             t_m = plain_t.search(inner)
             if t_m:
                 entries.append((m, False, t_m.group(1), xml_unescape(t_m.group(1))))
@@ -73,9 +73,11 @@ def _translate_shared_strings(xml_bytes: bytes, context: str) -> bytes:
             if not t_positions:
                 continue
             new_inner = inner
+            # Put the full translation in the last <t>, clear the rest to avoid duplicate text
             for i, tp in enumerate(reversed(t_positions)):
                 new_text  = translated if i == len(t_positions) - 1 else ""
                 new_inner = new_inner[:tp.start(1)] + new_text + new_inner[tp.end(1):]
+            # Strip phonetic ruby annotations — they're Japanese-specific and meaningless after translation
             new_inner = re.sub(r'<rPh\b[^>]*>.*?</rPh>', '', new_inner, flags=re.DOTALL)
             new_inner = re.sub(r'<phoneticPr\b[^>]*/>', '', new_inner)
         else:
@@ -84,14 +86,12 @@ def _translate_shared_strings(xml_bytes: bytes, context: str) -> bytes:
                 continue
             new_inner = inner[:tp.start(1)] + translated + inner[tp.end(1):]
             new_inner = re.sub(r'<rPh\b[^>]*>.*?</rPh>', '', new_inner, flags=re.DOTALL)
-            new_inner = re.sub(r'<phoneticPr\b[^>]*/>', '', new_inner)
+            new_inner = re.sub(r'<phoneticPr\b[^>]*/>', '', new_inner)  # remove Japanese phonetic guide
 
         result = result[:start] + f"<si>{new_inner}</si>" + result[end:]
 
     return result.encode("utf-8")
 
-
-# ── Worksheet XML ─────────────────────────────────────────────────────────────
 
 def _translate_sheet_xml(xml_bytes: bytes, context: str) -> bytes:
     text   = xml_bytes.decode("utf-8")
@@ -117,8 +117,6 @@ def _translate_sheet_xml(xml_bytes: bytes, context: str) -> bytes:
     return text.encode("utf-8")
 
 
-# ── Workbook XML (sheet tab names) ────────────────────────────────────────────
-
 def _translate_workbook_xml(xml_bytes: bytes, context: str) -> tuple[bytes, dict[str, str]]:
     text  = xml_bytes.decode("utf-8")
     # Unescape &quot; etc. in tab names before processing — a name like
@@ -139,9 +137,10 @@ def _translate_workbook_xml(xml_bytes: bytes, context: str) -> tuple[bytes, dict
         en = tmap[n]
         for ch in r'\/?*[]':
             en = en.replace(ch, "-")
-        en   = en.replace(":", "-").strip()[:31].rstrip()
+        en   = en.replace(":", "-").strip()[:31].rstrip()  # Excel tab names max 31 chars
         base, suffix = en, 2
         while en.lower() in seen:
+            # Deduplicate: append _2, _3 ... if another tab already has this name
             tag = f"_{suffix}"
             en  = base[:31 - len(tag)] + tag
             suffix += 1
@@ -157,8 +156,6 @@ def _translate_workbook_xml(xml_bytes: bytes, context: str) -> tuple[bytes, dict
     return text.encode("utf-8"), tmap
 
 
-# ── Formula sheet ref patching ────────────────────────────────────────────────
-
 def _patch_formula_sheet_refs(xml_bytes: bytes, sheet_name_map: dict[str, str]) -> bytes:
     if not sheet_name_map:
         return xml_bytes
@@ -168,8 +165,6 @@ def _patch_formula_sheet_refs(xml_bytes: bytes, sheet_name_map: dict[str, str]) 
         text = text.replace(f"{jp}!",   f"'{en}'!")
     return text.encode("utf-8")
 
-
-# ── Styles XML ────────────────────────────────────────────────────────────────
 
 def _set_fonts_arial_styles(xml_bytes: bytes) -> bytes:
     text = xml_bytes.decode("utf-8")
@@ -184,16 +179,12 @@ def _set_fonts_arial_shared_strings(xml_bytes: bytes) -> bytes:
     return text.encode("utf-8")
 
 
-# ── docProps/app.xml ──────────────────────────────────────────────────────────
-
 def _patch_docprops_app(xml_bytes: bytes, sheet_name_map: dict[str, str]) -> bytes:
     text = xml_bytes.decode("utf-8")
     for jp, en in sheet_name_map.items():
         text = text.replace(f">{jp}<", f">{en}<")
     return text.encode("utf-8")
 
-
-# ── Main entry point ──────────────────────────────────────────────────────────
 
 def _find_drawing_paths(all_items: list[tuple]) -> set[str]:
     """
@@ -259,6 +250,8 @@ def translate_xlsx(src: Path, dst: Path, context: str):
                 data  = orig_data
 
                 if fname == "xl/calcChain.xml":
+                    # Drop calcChain — it caches formula evaluation order by cell address,
+                    # which becomes stale after we rewrite shared strings. Excel rebuilds it on open.
                     continue
 
                 elif fname == "[Content_Types].xml":
@@ -295,6 +288,7 @@ def translate_xlsx(src: Path, dst: Path, context: str):
                 if data is orig_data:
                     zout.writestr(item, data)
                 else:
+                    # Reuse original ZipInfo metadata except compression, to avoid timestamp drift
                     new_info              = zipfile.ZipInfo(fname)
                     new_info.compress_type = zipfile.ZIP_DEFLATED
                     zout.writestr(new_info, data)

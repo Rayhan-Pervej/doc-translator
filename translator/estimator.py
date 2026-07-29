@@ -97,7 +97,7 @@ def _scan_file(path: Path) -> dict:
             doc.close()
 
     except Exception:
-        pass
+        pass  # if a file can't be read, just skip it — don't crash the whole estimate
     return result
 
 
@@ -110,10 +110,10 @@ def estimate_cost(src: Path) -> None:
         else [Path(dp) / fn for dp, _, fns in os.walk(src) for fn in fns]
     )
 
-    # ── Folder/file name translate_name() calls ───────────────────────────────
+    # count how many translate_name() calls will be made (folders + file stems + sheet tabs)
     name_calls = 0
     if src.is_dir():
-        seen: set[str] = set()
+        seen: set[str] = set()  # deduplicate — same folder name appearing in multiple places costs only one call
         for dirpath, dirnames, filenames in os.walk(src):
             for d in dirnames:
                 if has_japanese(d) and d not in seen:
@@ -125,7 +125,6 @@ def estimate_cost(src: Path) -> None:
                     seen.add(stem)
                     name_calls += 1
 
-    # ── Per-file content scan ─────────────────────────────────────────────────
     total_jp_chars = 0
     file_breakdown: list[tuple[str, str, int]] = []
 
@@ -142,17 +141,14 @@ def estimate_cost(src: Path) -> None:
         print("  No Japanese content found — nothing to translate.")
         return
 
-    # ── Token estimation ──────────────────────────────────────────────────────
-    # Calibrated from real runs (counting extracted text only, not raw XML):
-    #   Content:    JP chars × 1.4 input,  × 0.68 output
-    #   Name calls: 300 input + 50 output each
+    # Multipliers calibrated from real runs against extracted text (not raw XML).
+    # Content: JP chars × 1.4 input, × 0.68 output. Name calls: 300 in + 50 out each.
     est_input  = int(total_jp_chars * 1.4) + name_calls * 300
     est_output = int(total_jp_chars * 0.68) + name_calls * 50
     in_cost    = est_input  / 1_000_000 * _PRICE_INPUT_PER_M
     out_cost   = est_output / 1_000_000 * _PRICE_OUTPUT_PER_M
     total_cost = in_cost + out_cost
 
-    # ── Print ─────────────────────────────────────────────────────────────────
     print(f"\n  {'File':<50} {'Type':<6} {'JP chars':>9}")
     print(f"  {'-'*50} {'-'*6} {'-'*9}")
     for name, ext, jp in sorted(file_breakdown, key=lambda x: -x[2]):

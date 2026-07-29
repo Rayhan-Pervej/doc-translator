@@ -5,10 +5,12 @@ Used by all handlers and the estimator.
 
 from .client import translate
 
+# max strings per API call — keeps output under the 8096 token limit
 BATCH_CHUNK_SIZE = 40
 
 
 def has_japanese(text: str) -> bool:
+    # covers hiragana, katakana, kanji, and CJK compatibility ideographs
     return any(0x3000 <= ord(c) <= 0x9FFF or 0xF900 <= ord(c) <= 0xFAFF for c in text)
 
 
@@ -26,6 +28,7 @@ def xml_unescape(s: str) -> str:
 
 
 def _translate_chunk(chunk: list[str], context: str) -> dict[str, str]:
+    # send all strings in one API call using [N] numbering so we can map results back
     numbered = "\n".join(f"[{i+1}] {t}" for i, t in enumerate(chunk))
     prompt = (
         f"Translate the Japanese portions of each numbered text segment to English.\n"
@@ -52,6 +55,7 @@ def _translate_chunk(chunk: list[str], context: str) -> dict[str, str]:
 
 def batch_translate(texts: list[str], context: str) -> dict[str, str]:
     """Translate a list of unique Japanese strings. Returns {original: translated}."""
+    # deduplicate first so identical strings are only sent once
     unique = list(dict.fromkeys(t for t in texts if t.strip() and has_japanese(t)))
     if not unique:
         return {}
@@ -62,6 +66,7 @@ def batch_translate(texts: list[str], context: str) -> dict[str, str]:
         result.update(chunk_result)
         missing = [t for t in chunk if t not in chunk_result]
         if missing:
+            # API sometimes skips entries — keep originals so we don't lose data
             chunk_num = i // BATCH_CHUNK_SIZE + 1
             print(f"    [warn] {len(missing)} string(s) not returned by API in chunk {chunk_num}, keeping originals")
     return result

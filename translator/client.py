@@ -19,8 +19,8 @@ except ImportError:
 MODEL_ID   = os.environ.get("BEDROCK_MODEL_ID", "us.anthropic.claude-sonnet-4-6")
 AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
 
-_client = None
-_usage  = {"input_tokens": 0, "output_tokens": 0}
+_client = None  # lazy-initialized on first API call
+_usage  = {"input_tokens": 0, "output_tokens": 0}  # accumulates across all calls in a run
 
 
 def get_actual_usage() -> dict:
@@ -36,6 +36,7 @@ def _get_client():
         kwargs = {"region_name": AWS_REGION}
         key_id = os.environ.get("AWS_ACCESS_KEY_ID")
         secret = os.environ.get("AWS_SECRET_ACCESS_KEY")
+        # if keys are not in .env, boto3 falls back to ~/.aws/credentials automatically
         if key_id and secret:
             kwargs["aws_access_key_id"] = key_id
             kwargs["aws_secret_access_key"] = secret
@@ -54,11 +55,13 @@ def _invoke(prompt: str, max_tokens: int = 8096) -> str:
             response = _get_client().invoke_model(modelId=MODEL_ID, body=json.dumps(body))
             result   = json.loads(response["body"].read())
             usage    = result.get("usage", {})
+            # track real token usage so we can compare against the estimate at the end
             _usage["input_tokens"]  += usage.get("input_tokens", 0)
             _usage["output_tokens"] += usage.get("output_tokens", 0)
             return result["content"][0]["text"].strip()
         except ClientError as e:
             if e.response["Error"]["Code"] == "ThrottlingException":
+                # exponential backoff: 5s, 10s, 20s
                 wait = 2 ** attempt * 5
                 print(f"  Rate limited, waiting {wait}s...")
                 time.sleep(wait)

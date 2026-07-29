@@ -6,6 +6,7 @@ from ..client import translate
 
 
 def translate_txt(src: Path, dst: Path, context: str):
+    # detect encoding first — Japanese files are often Shift-JIS or EUC-JP, not UTF-8
     detection = from_path(src).best()
     encoding  = detection.encoding if detection else "utf-8"
     text      = src.read_text(encoding=encoding, errors="replace")
@@ -23,7 +24,7 @@ def translate_csv(src: Path, dst: Path, context: str):
     translated_rows = []
     for row in rows:
         translated_rows.append([
-            translate(cell, context=context) if cell.strip() else cell
+            translate(cell, context=context) if cell.strip() else cell  # skip empty cells
             for cell in row
         ])
 

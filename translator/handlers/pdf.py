@@ -3,6 +3,7 @@ from ..client import translate
 
 
 def _sample_bg(pix, bbox, scale):
+    # sample pixels just outside the text bounding box to guess the background color
     points = [
         (bbox.x0 + 2,                   bbox.y0 - 4),
         ((bbox.x0 + bbox.x1) / 2,       bbox.y0 - 4),
@@ -26,6 +27,7 @@ def translate_pdf(src: Path, dst: Path, context: str, max_pages: int = None):
     import fitz
 
     try:
+        # "notos" (Noto Sans) has better Unicode coverage than the built-in "helv" (Helvetica)
         fitz.Font("notos")
         _font = "notos"
     except Exception:
@@ -51,6 +53,7 @@ def translate_pdf(src: Path, dst: Path, context: str, max_pages: int = None):
                 line_text = "".join(s.get("text", "") for s in line_spans).strip()
                 if not line_text:
                     continue
+                # pick the most common font size in the line (mode), not the first
                 dominant_size = max(
                     set(s.get("size", 10) for s in line_spans),
                     key=lambda sz: sum(1 for s in line_spans if s.get("size", 10) == sz),
@@ -93,10 +96,11 @@ def translate_pdf(src: Path, dst: Path, context: str, max_pages: int = None):
         pix   = page.get_pixmap(dpi=150)
         scale = pix.width / page.rect.width
 
+        # redact (paint over) original text using the sampled background color
         for i, span in enumerate(spans):
             bg = _sample_bg(pix, fitz.Rect(span["bbox"]), scale)
             page.add_redact_annot(fitz.Rect(span["bbox"]), fill=bg)
-        page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
+        page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)  # don't touch images
 
         for i, span in enumerate(spans):
             translated  = translations.get(i + 1, span["text"])
@@ -113,11 +117,13 @@ def translate_pdf(src: Path, dst: Path, context: str, max_pages: int = None):
                 f'color: {text_color}; margin: 0; padding: 0;">{translated}</p>'
             )
             rc             = page.insert_htmlbox(bbox, html, scale_low=0.5)
+            # insert_htmlbox returns (overflow, scale) in newer fitz versions, just overflow in older
             overflow, scale_used = rc if isinstance(rc, tuple) else (rc, 1.0)
             if overflow > 0 or scale_used < 0.75:
+                # translation is longer than the original box — text may be cut off
                 print(f"    [warn] Page {page_num+1} span {i+1}: overflow={overflow} scale={scale_used:.2f}")
 
     dst.parent.mkdir(parents=True, exist_ok=True)
-    doc.subset_fonts()
+    doc.subset_fonts()  # embed only the glyphs actually used — keeps file size small
     doc.ez_save(str(dst))
     doc.close()

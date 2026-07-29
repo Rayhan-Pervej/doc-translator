@@ -17,17 +17,19 @@ def process_file(src: Path, dst: Path, context: str, max_pages: int = None):
     if handler:
         print(f"  Translating content: {src.name}")
         if ext == ".pdf":
-            handler(src, dst, context, max_pages=max_pages)
+            handler(src, dst, context, max_pages=max_pages)  # pdf takes an extra page limit arg
         else:
             handler(src, dst, context)
     else:
+        # unsupported format — copy as-is so the output folder is still complete
         print(f"  Copying (unsupported format): {src.name}")
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dst)
 
 
 def translate_folder(src_root: Path, dst_root: Path, max_pages: int = None):
-    # ── Phase 1: translate all folder names ───────────────────────────────────
+    # Phase 1: translate all folder names before processing any files,
+    # so we can build the correct output paths when we get to the files.
     print("\n── Phase 1: Translating folder names ──")
     folder_name_map: dict[Path, str] = {}
 
@@ -39,7 +41,8 @@ def translate_folder(src_root: Path, dst_root: Path, max_pages: int = None):
             folder_name_map[original] = translated
             print(f"    → {translated}")
 
-    # ── Phase 2: translate files ──────────────────────────────────────────────
+    # Phase 2: walk again and translate file contents, using the folder name map
+    # built in phase 1 to reconstruct translated output paths.
     print("\n── Phase 2: Translating files ──")
     errors: list[tuple[str, str]] = []
 
@@ -47,7 +50,7 @@ def translate_folder(src_root: Path, dst_root: Path, max_pages: int = None):
         src_dir   = Path(dirpath)
         rel_parts = src_dir.relative_to(src_root).parts
 
-        # Build translated output path
+        # rebuild the output path using translated folder names from phase 1
         translated_parts = []
         current = src_root
         for part in rel_parts:
@@ -78,6 +81,7 @@ def translate_folder(src_root: Path, dst_root: Path, max_pages: int = None):
                 print(f"  ERROR: {e}")
                 errors.append((str(src_file), str(e)))
                 try:
+                    # copy original so the output folder isn't missing a file
                     shutil.copy2(src_file, dst_dir / filename)
                     print(f"  Fallback: copied original as {filename}")
                 except Exception:

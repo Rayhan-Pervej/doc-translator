@@ -20,7 +20,7 @@ import os
 import ctypes
 from pathlib import Path
 
-# ── Unicode console setup (Windows) ──────────────────────────────────────────
+# Set UTF-8 mode so Japanese file paths and text display correctly on Windows
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 if hasattr(sys.stderr, "reconfigure"):
@@ -60,7 +60,6 @@ def main():
         print(f"Error: not found: {src}")
         sys.exit(1)
 
-    # ── Single file ───────────────────────────────────────────────────────────
     if src.is_file():
         print(f"Source:  {src}")
         estimate_cost(src)
@@ -92,7 +91,6 @@ def main():
         _print_actual_cost()
         sys.exit(0)
 
-    # ── Folder ────────────────────────────────────────────────────────────────
     dst = src.parent / (src.name + "_english")
     print(f"Source:  {src}")
     print(f"Output:  {dst}")

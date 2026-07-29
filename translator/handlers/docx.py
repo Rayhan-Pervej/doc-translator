@@ -11,6 +11,7 @@ def translate_docx(src: Path, dst: Path, context: str):
         if para.text.strip():
             translated = translate(para.text, context=context)
             if para.runs:
+                # put translation in first run, clear the rest to avoid duplicating text
                 para.runs[0].text = translated
                 for run in para.runs[1:]:
                     run.text = ""
