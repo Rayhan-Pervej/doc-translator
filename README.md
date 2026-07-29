@@ -11,19 +11,42 @@ Supports: **PDF, Excel (.xlsx), Word (.docx), CSV, TXT, Markdown**
 Given a folder of Japanese documents, it produces a mirror English folder:
 
 ```
-日本語文書/                          →    日本語文書_english/             (created next to input)
+日本語文書/                          →    日本語文書_english/
 ├── 人事部/                               ├── HR_Department/
 │   └── 採用資料/                         │   └── Recruitment_Materials/
-│       └── 求人票.txt                    │       └── Job_Posting.txt        ← content translated
+│       └── 求人票.txt                    │       └── Job_Posting.txt
 ├── 製品情報/                              ├── Product_Information/
-│   └── 製品概要.txt                      │   └── Product_Overview.txt       ← content translated
-└── 報告書.pdf                            └── Report.pdf                     ← text replaced in-place
+│   └── 製品概要.txt                      │   └── Product_Overview.txt
+└── 報告書.pdf                            └── Report.pdf
 ```
 
 - Folder names → translated to English
 - File names → translated to English
 - File contents → translated to English (formatting preserved)
-- PDF text is replaced in-place (layout, images, colors preserved)
+- Cost is estimated before any API calls are made — you confirm before spending
+
+---
+
+## Project Structure
+
+```
+doc-translator/
+├── main.py                  ← entry point (run this)
+├── requirements.txt
+├── .env                     ← your AWS credentials (not committed)
+├── .env.example             ← template
+│
+└── translator/
+    ├── client.py            ← Bedrock API client + token tracking
+    ├── common.py            ← shared helpers (Japanese detection, XML, batch translate)
+    ├── estimator.py         ← cost estimation (no API calls)
+    ├── pipeline.py          ← folder walking + file routing
+    └── handlers/
+        ├── txt.py           ← .txt, .md, .csv
+        ├── docx.py          ← .docx
+        ├── xlsx.py          ← .xlsx
+        └── pdf.py           ← .pdf
+```
 
 ---
 
@@ -57,29 +80,13 @@ python3 -m venv venv
 source venv/bin/activate
 ```
 
-Once activated, your terminal prompt will show `(venv)` at the start:
-```
-(venv) PS D:\Projects\doc-translator>
-```
-
-> **Note:** You must activate the venv every time you open a new terminal before running the tool. To deactivate, run `deactivate`.
-
 ### 3. Install dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
 
-To verify everything installed correctly:
-```bash
-pip list
-```
-
-You should see packages like `boto3`, `python-docx`, `openpyxl`, `pymupdf`, `charset-normalizer` in the list.
-
 ### 4. Configure AWS credentials
-
-Copy the example env file:
 
 ```bash
 # Windows
@@ -89,7 +96,7 @@ copy .env.example .env
 cp .env.example .env
 ```
 
-Open `.env` and fill in your AWS credentials:
+Open `.env` and fill in your credentials:
 
 ```env
 AWS_ACCESS_KEY_ID=your_access_key_here
@@ -98,62 +105,73 @@ AWS_REGION=us-east-1
 BEDROCK_MODEL_ID=us.anthropic.claude-sonnet-4-6
 ```
 
-> **Note:** If you already have AWS configured via `aws configure` (credentials in `~/.aws/credentials`), you can leave the key lines commented out — the tool will use your AWS profile automatically.
+> If you already have AWS configured via `aws configure`, leave the key lines blank — the tool will use your AWS profile automatically.
 
 ---
 
 ## Usage
 
 ```bash
-python translate.py <input_folder>
+# Windows (always use -X utf8 for Japanese paths)
+python -X utf8 main.py "D:\Documents\japanese_docs"
+
+# macOS / Linux
+python main.py "/Users/rayhan/Desktop/japanese_docs"
 ```
 
-The output folder is created automatically **next to the input folder** (same parent directory), named `<folder>_english`. No need to specify an output path.
+Output is created **next to the input**, named `<folder>_english`:
+```
+D:\Documents\japanese_docs  →  D:\Documents\japanese_docs_english
+```
 
-**Windows:**
+### Single file mode
+
 ```bash
-python translate.py "D:\Documents\japanese_docs"
-# → output: D:\Documents\japanese_docs_english
+python -X utf8 main.py "D:\Documents\report.xlsx"
 ```
-
-**macOS / Linux:**
-```bash
-python translate.py "/Users/rayhan/Desktop/japanese_docs"
-# → output: /Users/rayhan/Desktop/japanese_docs_english
-```
-
-The source folder name can be in Japanese:
-```bash
-python translate.py "/Users/rayhan/Desktop/日本語文書"
-# → output: /Users/rayhan/Desktop/日本語文書_english
-```
-
-> **Windows tip:** If your folder name contains Japanese characters, run with `python -X utf8 translate.py ...` or set `PYTHONUTF8=1` in your environment.
 
 ### Options
 
 | Flag | Description |
-|---|---|
-| `--pages N` | Only translate the first N pages of each PDF (useful for testing) |
+|------|-------------|
+| `--pages N` | Only translate first N pages of each PDF (useful for testing) |
 
-**Example — test with 2 PDF pages only:**
-```bash
-python translate.py "D:\input\japanese_docs" --pages 2
+---
+
+## Cost Estimation
+
+Before any translation starts, the tool scans all files and shows a cost estimate:
+
 ```
+  File                          Type    JP chars
+  ----------------------------- ------  --------
+  業務フロー.xlsx               .xlsx     21,029
+
+  Total Japanese characters :     21,029
+  Name translation calls    :         18
+  Est. input tokens         :     34,840
+  Est. output tokens        :     15,199
+
+  Estimated total cost      :  $0.3325  (~$0.4323 with overhead)
+
+  Proceed with translation? (y/n):
+```
+
+Actual cost is printed at the end for comparison. Estimates are typically within ±5% of actual.
 
 ---
 
 ## Supported File Types
 
 | Format | What gets translated |
-|---|---|
+|--------|---------------------|
+| `.xlsx` | Cell text, drawing shapes, sheet tab names |
 | `.pdf` | All text, replaced in-place (layout preserved) |
-| `.xlsx` | All cell values |
 | `.docx` | Paragraphs and table cells |
 | `.csv` | All cell values |
 | `.txt` | Full file content |
 | `.md` | Full file content |
-| Other | Copied as-is (no translation) |
+| Other | Copied as-is |
 
 ---
 
@@ -163,29 +181,27 @@ python translate.py "D:\input\japanese_docs" --pages 2
 2. Go to **Amazon Bedrock** → **Model access**
 3. Enable **Anthropic Claude** models
 4. Create an IAM user with `AmazonBedrockFullAccess` policy
-5. Generate an Access Key and Secret Key for that user
-6. Paste them into your `.env` file
-
----
-
-## Security
-
-- **Never commit `.env`** — it contains your AWS credentials. It is already in `.gitignore`.
-- Share `.env.example` instead (no real credentials).
-- Translated output folders are also excluded from git by default.
+5. Generate Access Key + Secret Key and paste into `.env`
 
 ---
 
 ## Troubleshooting
 
-**`UnrecognizedClientException: The security token included in the request is invalid`**
-→ Your AWS credentials in `.env` are incorrect or expired. Double-check `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`.
+**`UnrecognizedClientException`**
+→ AWS credentials in `.env` are incorrect or expired.
 
 **`ModuleNotFoundError`**
 → Run `pip install -r requirements.txt` inside your virtual environment.
 
 **PDF pages come out blank**
-→ The PDF may be image-only (scanned). This tool only translates text-based PDFs — scanned documents are not supported yet.
+→ The PDF may be image-only (scanned). Only text-based PDFs are supported.
 
-**Text in PDF looks small or cut off**
-→ English text is typically longer than Japanese. The tool auto-shrinks text to fit. For very tight layouts this is expected behavior.
+**Excel opens with repair warning**
+→ Close the file in Excel before re-running. If it persists, check for the `.tmp.xlsx` leftover and delete it.
+
+---
+
+## Security
+
+- **Never commit `.env`** — it contains your AWS credentials. Already in `.gitignore`.
+- Share `.env.example` instead.
