@@ -711,51 +711,82 @@ def process_file(src: Path, dst: Path, context: str, max_pages: int = None):
 _PRICE_INPUT_PER_M  = 3.00
 _PRICE_OUTPUT_PER_M = 15.00
 
-def _count_japanese_chars(path: Path) -> int:
-    """Count Japanese characters in a file across all supported formats."""
+
+def _jp(text: str) -> int:
+    return sum(1 for c in text if 0x3000 <= ord(c) <= 0x9FFF or 0xF900 <= ord(c) <= 0xFAFF)
+
+
+def _scan_file(path: Path) -> dict:
+    """
+    Scan one file and return exactly what will be translated:
+      jp_chars   — Japanese chars in translatable content
+      name_calls — extra translate_name() calls inside the file (xlsx sheet tabs)
+    """
     ext = path.suffix.lower()
-    count = 0
+    result = {"jp_chars": 0, "name_calls": 0}
     try:
-        if ext in (".txt", ".md", ".csv"):
-            from charset_normalizer import from_path
-            detection = from_path(path).best()
-            encoding = detection.encoding if detection else "utf-8"
-            text = path.read_text(encoding=encoding, errors="replace")
-            count = sum(1 for c in text if 0x3000 <= ord(c) <= 0x9FFF or 0xF900 <= ord(c) <= 0xFAFF)
+        if ext in (".txt", ".md"):
+            text = path.read_text(encoding="utf-8", errors="replace")
+            result["jp_chars"] = _jp(text)
+
+        elif ext == ".csv":
+            from charset_normalizer import from_path as _fp
+            import csv as _csv
+            enc = (_fp(path).best() or None)
+            enc = enc.encoding if enc else "utf-8"
+            with open(path, encoding=enc, errors="replace", newline="") as f:
+                rows = list(_csv.reader(f))
+            result["jp_chars"] = sum(_jp(cell) for row in rows for cell in row)
 
         elif ext == ".docx":
-            import zipfile
-            with zipfile.ZipFile(path) as z:
-                for name in z.namelist():
-                    if name.endswith(".xml"):
-                        content = z.read(name).decode("utf-8", errors="replace")
-                        count += sum(1 for c in content if 0x3000 <= ord(c) <= 0x9FFF or 0xF900 <= ord(c) <= 0xFAFF)
+            from docx import Document as _Doc
+            doc = _Doc(str(path))
+            for para in doc.paragraphs:
+                result["jp_chars"] += _jp(para.text)
+            for table in doc.tables:
+                for row in table.rows:
+                    for cell in row.cells:
+                        for para in cell.paragraphs:
+                            result["jp_chars"] += _jp(para.text)
 
         elif ext == ".xlsx":
-            import zipfile
+            import zipfile, re as _re
             with zipfile.ZipFile(path) as z:
-                for name in z.namelist():
-                    if name.endswith(".xml"):
-                        content = z.read(name).decode("utf-8", errors="replace")
-                        count += sum(1 for c in content if 0x3000 <= ord(c) <= 0x9FFF or 0xF900 <= ord(c) <= 0xFAFF)
+                names = z.namelist()
+                # sharedStrings — main cell text
+                if "xl/sharedStrings.xml" in names:
+                    result["jp_chars"] += _jp(z.read("xl/sharedStrings.xml").decode("utf-8", errors="replace"))
+                # drawings — diagram/shape text
+                for n in names:
+                    if n.startswith("xl/drawings/") and n.endswith(".xml") and not n.endswith(".rels"):
+                        result["jp_chars"] += _jp(z.read(n).decode("utf-8", errors="replace"))
+                # worksheets — inline strings + cached formula values
+                for n in names:
+                    if n.startswith("xl/worksheets/") and n.endswith(".xml"):
+                        result["jp_chars"] += _jp(z.read(n).decode("utf-8", errors="replace"))
+                # sheet tab names → each JP tab = 1 translate_name() call
+                wb = z.read("xl/workbook.xml").decode("utf-8")
+                for tab in _re.findall(r'name="([^"]+)"', wb):
+                    if _has_japanese(tab):
+                        result["name_calls"] += 1
 
         elif ext == ".pdf":
             import fitz
             doc = fitz.open(str(path))
             for page in doc:
-                text = page.get_text()
-                count += sum(1 for c in text if 0x3000 <= ord(c) <= 0x9FFF or 0xF900 <= ord(c) <= 0xFAFF)
+                result["jp_chars"] += _jp(page.get_text())
             doc.close()
+
     except Exception:
         pass
-    return count
+    return result
 
 
 def estimate_cost(src: Path) -> None:
     """Scan src (file or folder), estimate token usage and cost, ask user to confirm."""
     print("\n── Estimating cost ──────────────────────────────────────────────")
 
-    files = []
+    files: list[Path] = []
     if src.is_file():
         files = [src]
     else:
@@ -764,39 +795,59 @@ def estimate_cost(src: Path) -> None:
                 files.append(Path(dirpath) / fname)
 
     supported_exts = {".txt", ".md", ".csv", ".docx", ".xlsx", ".pdf"}
+
+    # ── 1. Folder & file name calls ───────────────────────────────────────────
+    # Each unique Japanese folder name or file stem = 1 translate_name() API call
+    name_calls = 0
+    if src.is_dir():
+        seen: set[str] = set()
+        for dirpath, dirnames, filenames in os.walk(src):
+            for d in dirnames:
+                if _has_japanese(d) and d not in seen:
+                    seen.add(d)
+                    name_calls += 1
+            for fn in filenames:
+                stem = Path(fn).stem
+                if _has_japanese(stem) and stem not in seen:
+                    seen.add(stem)
+                    name_calls += 1
+
+    # ── 2. Per-file content scan ──────────────────────────────────────────────
     total_jp_chars = 0
     file_breakdown = []
 
     for f in files:
-        ext = f.suffix.lower()
-        if ext not in supported_exts:
+        if f.suffix.lower() not in supported_exts:
             continue
-        jp = _count_japanese_chars(f)
+        info = _scan_file(f)
+        jp = info["jp_chars"]
+        name_calls += info["name_calls"]
         if jp > 0:
-            file_breakdown.append((f.name, ext, jp))
+            file_breakdown.append((f.name, f.suffix.lower(), jp))
             total_jp_chars += jp
 
-    if not file_breakdown:
+    if not file_breakdown and name_calls == 0:
         print("  No Japanese content found — nothing to translate.")
         return
 
-    # Token estimation (calibrated from real runs):
-    # Input:  JP chars × 1.2 — accounts for prompt overhead + ~1.1 tokens/char average
-    # Output: JP chars × 0.45 — English translations are much shorter than JP char count suggests
-    estimated_input_tokens  = int(total_jp_chars * 1.2)
-    estimated_output_tokens = int(total_jp_chars * 0.45)
+    # ── 3. Token estimation ───────────────────────────────────────────────────
+    # Content batches: JP chars × 1.2 input, × 0.45 output (calibrated from real runs)
+    # Name calls:      each translate_name() ≈ 300 input + 50 output tokens
+    estimated_input_tokens  = int(total_jp_chars * 1.2) + name_calls * 300
+    estimated_output_tokens = int(total_jp_chars * 0.45) + name_calls * 50
 
     input_cost  = (estimated_input_tokens  / 1_000_000) * _PRICE_INPUT_PER_M
     output_cost = (estimated_output_tokens / 1_000_000) * _PRICE_OUTPUT_PER_M
     total_cost  = input_cost + output_cost
 
-    # Print breakdown
+    # ── 4. Print breakdown ────────────────────────────────────────────────────
     print(f"\n  {'File':<50} {'Type':<6} {'JP chars':>9}")
     print(f"  {'-'*50} {'-'*6} {'-'*9}")
     for name, ext, jp in sorted(file_breakdown, key=lambda x: -x[2]):
         print(f"  {name[:50]:<50} {ext:<6} {jp:>9,}")
 
     print(f"\n  Total Japanese characters : {total_jp_chars:>10,}")
+    print(f"  Name translation calls    : {name_calls:>10,}  (folders, files, sheet tabs)")
     print(f"  Est. input tokens         : {estimated_input_tokens:>10,}")
     print(f"  Est. output tokens        : {estimated_output_tokens:>10,}")
     print(f"\n  Input cost  (${_PRICE_INPUT_PER_M:.2f}/M tokens) : ${input_cost:.4f}")
