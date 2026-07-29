@@ -780,13 +780,11 @@ def estimate_cost(src: Path) -> None:
         print("  No Japanese content found — nothing to translate.")
         return
 
-    # Token estimation:
-    # Japanese chars → ~1.5 tokens each (kanji/kana compress well)
-    # We send each batch with ~200 token prompt overhead per API call
-    # Rough API calls: 1 per sheet/page/file
-    # Output: English is ~2x longer than Japanese in chars, ~1 token per word ≈ jp_chars * 0.8
-    estimated_input_tokens  = int(total_jp_chars * 1.5)
-    estimated_output_tokens = int(total_jp_chars * 0.8)
+    # Token estimation (calibrated from real runs):
+    # Input:  JP chars × 1.2 — accounts for prompt overhead + ~1.1 tokens/char average
+    # Output: JP chars × 0.45 — English translations are much shorter than JP char count suggests
+    estimated_input_tokens  = int(total_jp_chars * 1.2)
+    estimated_output_tokens = int(total_jp_chars * 0.45)
 
     input_cost  = (estimated_input_tokens  / 1_000_000) * _PRICE_INPUT_PER_M
     output_cost = (estimated_output_tokens / 1_000_000) * _PRICE_OUTPUT_PER_M
