@@ -1,9 +1,22 @@
+# Credentials
 .env
+
+# Python
 venv/
 __pycache__/
 *.pyc
+*.pyo
+
+# Test & output data
 test_data/
+*_english/
 output/
+
+# Temp files created during translation
+*.tmp.xlsx
+
+# Document files (may contain sensitive data)
 *.pdf
 *.xlsx
 *.docx
+*.csv
