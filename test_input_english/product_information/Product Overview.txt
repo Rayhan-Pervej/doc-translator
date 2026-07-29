@@ -1,7 +1,0 @@
-Product Name: スマートウォッチ X1
-
-Key Features:
-- Heart rate monitoring
-- Built-in GPS functionality
-- Water resistance rating: IPX7
-- Battery life: 7 days

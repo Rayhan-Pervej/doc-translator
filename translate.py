@@ -117,16 +117,22 @@ def translate_docx(src: Path, dst: Path, context: str):
 
 
 def _translate_drawing_xml(xml_bytes: bytes, context: str) -> bytes:
-    """Translate <a:t> text and set fonts to Arial using regex — no ET serialization to avoid namespace pollution."""
+    """Translate text runs and set fonts to Arial in a DrawingML XML file.
+
+    Matches by local name (:t, :latin, :ea, :cs) regardless of namespace prefix,
+    so files that use a non-standard prefix (rare but valid XML) still work.
+    """
     import re
 
     text = xml_bytes.decode("utf-8")
 
-    # Collect unique Japanese <a:t> values (unescape entities before translation)
-    all_t = re.findall(r'(<a:t[^>]*>)([^<]*)(</a:t>)', text)
+    # Match any namespace-prefixed <*:t> text node, e.g. <a:t>, <p:t>, <wps:t>
+    t_pat = re.compile(r'(<\w+:t(?:\s[^>]*)?>)([^<]*)(</\w+:t>)')
+
+    # Collect unique Japanese text values
     unique = list(dict.fromkeys(
-        _xml_unescape(t[1]) for t in all_t
-        if t[1].strip() and _has_japanese(_xml_unescape(t[1]))
+        _xml_unescape(m[1]) for m in t_pat.findall(text)
+        if m[1].strip() and _has_japanese(_xml_unescape(m[1]))
     ))
     if unique:
         tmap = _batch_translate_xml_texts(unique, context)
@@ -134,12 +140,17 @@ def _translate_drawing_xml(xml_bytes: bytes, context: str) -> bytes:
             plain = _xml_unescape(m.group(2))
             xlated = tmap.get(plain, plain)
             return m.group(1) + _xml_escape(xlated) + m.group(3)
-        text = re.sub(r'(<a:t[^>]*>)([^<]*)(</a:t>)', replace_t, text)
+        text = t_pat.sub(replace_t, text)
 
-    # Set all latin/ea/cs fonts to Arial
-    text = re.sub(r'(<a:latin\b[^>]*\btypeface=")[^"]*(")', r'\1Arial\2', text)
-    text = re.sub(r'(<a:ea\b[^>]*\btypeface=")[^"]*(")', r'\1Arial\2', text)
-    text = re.sub(r'(<a:cs\b[^>]*\btypeface=")[^"]*(")', r'\1Arial\2', text)
+    # Set fonts to Arial — match any prefix: <a:latin>, <wps:latin>, etc.
+    text = re.sub(r'(<\w+:latin\b[^>]*\btypeface=")[^"]*(")', r'\1Arial\2', text)
+    text = re.sub(r'(<\w+:ea\b[^>]*\btypeface=")[^"]*(")', r'\1Arial\2', text)
+    text = re.sub(r'(<\w+:cs\b[^>]*\btypeface=")[^"]*(")', r'\1Arial\2', text)
+
+    # Replace <*:noAutofit/> with <*:normAutofit/> so translated text (which is
+    # longer than Japanese) auto-shrinks to fit the existing shape without moving
+    # it — connections, icons, and layout all stay exactly in place.
+    text = re.sub(r'<(\w+:)noAutofit/>', r'<\1normAutofit/>', text)
 
     return text.encode("utf-8")
 
