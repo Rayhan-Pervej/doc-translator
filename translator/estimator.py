@@ -50,16 +50,40 @@ def _scan_file(path: Path) -> dict:
         elif ext == ".xlsx":
             with zipfile.ZipFile(path) as z:
                 names = z.namelist()
+
+                # sharedStrings — extract only <t> tag text content, not raw XML
                 if "xl/sharedStrings.xml" in names:
-                    result["jp_chars"] += jp_char_count(
-                        z.read("xl/sharedStrings.xml").decode("utf-8", errors="replace")
-                    )
+                    ss = z.read("xl/sharedStrings.xml").decode("utf-8", errors="replace")
+                    for t in re.findall(r'<t(?:\s[^>]*)?>([^<]*)</t>', ss):
+                        result["jp_chars"] += jp_char_count(t)
+
+                # drawings — discover via .rels files (same logic as handler)
+                import posixpath
+                drawing_names: set[str] = set()
+                drawing_type = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing"
                 for n in names:
-                    if n.startswith("xl/drawings/") and n.endswith(".xml") and not n.endswith(".rels"):
-                        result["jp_chars"] += jp_char_count(z.read(n).decode("utf-8", errors="replace"))
+                    if n.startswith("xl/worksheets/_rels/") and n.endswith(".rels"):
+                        rels = z.read(n).decode("utf-8", errors="replace")
+                        for target in re.findall(rf'Type="{re.escape(drawing_type)}"[^>]*Target="([^"]+)"', rels):
+                            full = posixpath.normpath(posixpath.join("xl/worksheets/", target)).lstrip("/")
+                            drawing_names.add(full)
+                if not drawing_names:
+                    drawing_names = {n for n in names if n.startswith("xl/drawings/") and n.endswith(".xml") and not n.endswith(".rels")}
+                for n in drawing_names:
+                    xml = z.read(n).decode("utf-8", errors="replace")
+                    for t in re.findall(r'<\w+:t(?:\s[^>]*)?>([^<]*)</\w+:t>', xml):
+                        result["jp_chars"] += jp_char_count(t)
+
+                # worksheets — extract inline strings and cached formula string values
                 for n in names:
                     if n.startswith("xl/worksheets/") and n.endswith(".xml"):
-                        result["jp_chars"] += jp_char_count(z.read(n).decode("utf-8", errors="replace"))
+                        xml = z.read(n).decode("utf-8", errors="replace")
+                        for t in re.findall(r'<is><t>([^<]*)</t></is>', xml):
+                            result["jp_chars"] += jp_char_count(t)
+                        for t in re.findall(r'<c [^>]*t="str"[^>]*>(?:<f[^>]*>[^<]*</f>)?<v>([^<]+)</v>', xml):
+                            result["jp_chars"] += jp_char_count(t)
+
+                # sheet tab names
                 wb = z.read("xl/workbook.xml").decode("utf-8")
                 for tab in re.findall(r'name="([^"]+)"', wb):
                     if has_japanese(tab):
@@ -119,11 +143,11 @@ def estimate_cost(src: Path) -> None:
         return
 
     # ── Token estimation ──────────────────────────────────────────────────────
-    # Calibrated from real runs:
-    #   Content:    JP chars × 1.2 input,  × 0.45 output
+    # Calibrated from real runs (counting extracted text only, not raw XML):
+    #   Content:    JP chars × 1.4 input,  × 0.68 output
     #   Name calls: 300 input + 50 output each
-    est_input  = int(total_jp_chars * 1.2) + name_calls * 300
-    est_output = int(total_jp_chars * 0.45) + name_calls * 50
+    est_input  = int(total_jp_chars * 1.4) + name_calls * 300
+    est_output = int(total_jp_chars * 0.68) + name_calls * 50
     in_cost    = est_input  / 1_000_000 * _PRICE_INPUT_PER_M
     out_cost   = est_output / 1_000_000 * _PRICE_OUTPUT_PER_M
     total_cost = in_cost + out_cost
