@@ -39,7 +39,7 @@ if sys.platform == "win32":
     ctypes.windll.kernel32.SetConsoleCP(65001)
     ctypes.windll.kernel32.SetConsoleOutputCP(65001)
 
-from translator import translate, translate_name
+from translator import translate, translate_name, get_actual_usage
 
 
 # ── File handlers ──────────────────────────────────────────────────────────────
@@ -159,12 +159,12 @@ def _has_japanese(text: str) -> bool:
     return any(0x3000 <= ord(c) <= 0x9FFF or 0xF900 <= ord(c) <= 0xFAFF for c in text)
 
 
-def _batch_translate_xml_texts(texts: list[str], context: str) -> dict[str, str]:
-    """Batch translate a list of unique strings, return {original: translated}."""
-    unique = list(dict.fromkeys(t for t in texts if t.strip() and _has_japanese(t)))
-    if not unique:
-        return {}
-    numbered = "\n".join(f"[{i+1}] {t}" for i, t in enumerate(unique))
+_BATCH_CHUNK_SIZE = 40  # strings per API call — keeps output well under 8096 tokens
+
+
+def _translate_chunk(chunk: list[str], context: str) -> dict[str, str]:
+    """Translate a single chunk of strings (≤ _BATCH_CHUNK_SIZE). Returns {original: translated}."""
+    numbered = "\n".join(f"[{i+1}] {t}" for i, t in enumerate(chunk))
     batch_prompt = (
         f"Translate the Japanese portions of each numbered text segment to English.\n"
         f"Return ONLY the translations, one per line, keeping the same [N] numbering.\n"
@@ -182,9 +182,32 @@ def _batch_translate_xml_texts(texts: list[str], context: str) -> dict[str, str]
             try:
                 idx = int(ln[1:ln.index("]")])
                 val = ln[ln.index("]") + 1:].strip()
-                result[unique[idx - 1]] = val
+                result[chunk[idx - 1]] = val
             except (ValueError, IndexError):
                 pass
+    return result
+
+
+def _batch_translate_xml_texts(texts: list[str], context: str) -> dict[str, str]:
+    """Batch translate a list of unique strings, return {original: translated}.
+
+    Automatically splits into chunks of _BATCH_CHUNK_SIZE so the API response
+    never exceeds the 8096 output-token limit.
+    """
+    unique = list(dict.fromkeys(t for t in texts if t.strip() and _has_japanese(t)))
+    if not unique:
+        return {}
+
+    result: dict[str, str] = {}
+    for i in range(0, len(unique), _BATCH_CHUNK_SIZE):
+        chunk = unique[i:i + _BATCH_CHUNK_SIZE]
+        chunk_result = _translate_chunk(chunk, context)
+        result.update(chunk_result)
+        # Warn if any strings in the chunk came back untranslated
+        missing = [t for t in chunk if t not in chunk_result]
+        if missing:
+            chunk_num = i // _BATCH_CHUNK_SIZE + 1
+            print(f"    [warn] {len(missing)} string(s) not returned by API in chunk {chunk_num}, keeping originals")
     return result
 
 
@@ -682,6 +705,117 @@ def process_file(src: Path, dst: Path, context: str, max_pages: int = None):
         shutil.copy2(src, dst)
 
 
+# ── Cost estimation ────────────────────────────────────────────────────────────
+
+# AWS Bedrock Claude Sonnet 4.6 pricing (per million tokens)
+_PRICE_INPUT_PER_M  = 3.00
+_PRICE_OUTPUT_PER_M = 15.00
+
+def _count_japanese_chars(path: Path) -> int:
+    """Count Japanese characters in a file across all supported formats."""
+    ext = path.suffix.lower()
+    count = 0
+    try:
+        if ext in (".txt", ".md", ".csv"):
+            from charset_normalizer import from_path
+            detection = from_path(path).best()
+            encoding = detection.encoding if detection else "utf-8"
+            text = path.read_text(encoding=encoding, errors="replace")
+            count = sum(1 for c in text if 0x3000 <= ord(c) <= 0x9FFF or 0xF900 <= ord(c) <= 0xFAFF)
+
+        elif ext == ".docx":
+            import zipfile
+            with zipfile.ZipFile(path) as z:
+                for name in z.namelist():
+                    if name.endswith(".xml"):
+                        content = z.read(name).decode("utf-8", errors="replace")
+                        count += sum(1 for c in content if 0x3000 <= ord(c) <= 0x9FFF or 0xF900 <= ord(c) <= 0xFAFF)
+
+        elif ext == ".xlsx":
+            import zipfile
+            with zipfile.ZipFile(path) as z:
+                for name in z.namelist():
+                    if name.endswith(".xml"):
+                        content = z.read(name).decode("utf-8", errors="replace")
+                        count += sum(1 for c in content if 0x3000 <= ord(c) <= 0x9FFF or 0xF900 <= ord(c) <= 0xFAFF)
+
+        elif ext == ".pdf":
+            import fitz
+            doc = fitz.open(str(path))
+            for page in doc:
+                text = page.get_text()
+                count += sum(1 for c in text if 0x3000 <= ord(c) <= 0x9FFF or 0xF900 <= ord(c) <= 0xFAFF)
+            doc.close()
+    except Exception:
+        pass
+    return count
+
+
+def estimate_cost(src: Path) -> None:
+    """Scan src (file or folder), estimate token usage and cost, ask user to confirm."""
+    print("\n── Estimating cost ──────────────────────────────────────────────")
+
+    files = []
+    if src.is_file():
+        files = [src]
+    else:
+        for dirpath, _, filenames in os.walk(src):
+            for fname in filenames:
+                files.append(Path(dirpath) / fname)
+
+    supported_exts = {".txt", ".md", ".csv", ".docx", ".xlsx", ".pdf"}
+    total_jp_chars = 0
+    file_breakdown = []
+
+    for f in files:
+        ext = f.suffix.lower()
+        if ext not in supported_exts:
+            continue
+        jp = _count_japanese_chars(f)
+        if jp > 0:
+            file_breakdown.append((f.name, ext, jp))
+            total_jp_chars += jp
+
+    if not file_breakdown:
+        print("  No Japanese content found — nothing to translate.")
+        return
+
+    # Token estimation:
+    # Japanese chars → ~1.5 tokens each (kanji/kana compress well)
+    # We send each batch with ~200 token prompt overhead per API call
+    # Rough API calls: 1 per sheet/page/file
+    # Output: English is ~2x longer than Japanese in chars, ~1 token per word ≈ jp_chars * 0.8
+    estimated_input_tokens  = int(total_jp_chars * 1.5)
+    estimated_output_tokens = int(total_jp_chars * 0.8)
+
+    input_cost  = (estimated_input_tokens  / 1_000_000) * _PRICE_INPUT_PER_M
+    output_cost = (estimated_output_tokens / 1_000_000) * _PRICE_OUTPUT_PER_M
+    total_cost  = input_cost + output_cost
+
+    # Print breakdown
+    print(f"\n  {'File':<50} {'Type':<6} {'JP chars':>9}")
+    print(f"  {'-'*50} {'-'*6} {'-'*9}")
+    for name, ext, jp in sorted(file_breakdown, key=lambda x: -x[2]):
+        print(f"  {name[:50]:<50} {ext:<6} {jp:>9,}")
+
+    print(f"\n  Total Japanese characters : {total_jp_chars:>10,}")
+    print(f"  Est. input tokens         : {estimated_input_tokens:>10,}")
+    print(f"  Est. output tokens        : {estimated_output_tokens:>10,}")
+    print(f"\n  Input cost  (${_PRICE_INPUT_PER_M:.2f}/M tokens) : ${input_cost:.4f}")
+    print(f"  Output cost (${_PRICE_OUTPUT_PER_M:.2f}/M tokens) : ${output_cost:.4f}")
+    print(f"  ─────────────────────────────────────────")
+    print(f"  Estimated total cost      :  ${total_cost:.4f}  (~${total_cost*1.3:.4f} with overhead)")
+    print(f"\n  Model: {os.environ.get('BEDROCK_MODEL_ID', 'us.anthropic.claude-sonnet-4-6')}")
+    print(f"  Note: Estimate is approximate. Actual cost depends on batch sizes and overhead.")
+    print()
+
+    answer = input("  Proceed with translation? (y/n): ").strip().lower()
+    if answer != "y":
+        print("Aborted.")
+        sys.exit(0)
+    print()
+
+
 # ── Main pipeline ──────────────────────────────────────────────────────────────
 
 def translate_folder(src_root: Path, dst_root: Path, max_pages: int = None):
@@ -758,14 +892,12 @@ def translate_folder(src_root: Path, dst_root: Path, max_pages: int = None):
                     pass
 
     # Summary
-    print("\n── Done ──")
-    print(f"Output: {dst_root}")
     if errors:
         print(f"\n{len(errors)} file(s) had errors:")
         for path, err in errors:
             print(f"  {path}: {err}")
     else:
-        print("All files translated successfully.")
+        print("\nAll files translated successfully.")
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
@@ -798,13 +930,14 @@ if __name__ == "__main__":
 
     # ── Single file mode ──────────────────────────────────────────────────────
     if src.is_file():
+        print(f"Source:  {src}")
+        estimate_cost(src)  # scan + confirm before doing anything
         stem = src.stem
         ext = src.suffix
         translated_stem = translate_name(stem, context=f"file in folder: {src.parent.name}")
         dst_dir = src.parent.parent / (src.parent.name + "_english")
         dst_dir.mkdir(parents=True, exist_ok=True)
         dst_file = dst_dir / (translated_stem + ext)
-        print(f"Source:  {src}")
         print(f"Output:  {dst_file}")
         if dst_file.exists():
             answer = input("Output file already exists. Overwrite? (y/n): ").strip().lower()
@@ -813,23 +946,29 @@ if __name__ == "__main__":
                 sys.exit(0)
         context = f"Document '{translated_stem + ext}' in folder '{src.parent.name}'"
         process_file(src, dst_file, context, max_pages=max_pages)
+        actual = get_actual_usage()
         print("\n── Done ──")
         print(f"Output: {dst_file}")
+        print(f"Actual tokens used  — input: {actual['input_tokens']:,}  output: {actual['output_tokens']:,}")
+        print(f"Actual cost         : ${actual['cost_usd']:.4f}")
         sys.exit(0)
 
     # ── Folder mode ───────────────────────────────────────────────────────────
     dst = src.parent / (src.name + "_english")
 
+    print(f"Source:  {src}")
+    print(f"Output:  {dst}")
+    estimate_cost(src)  # scan + confirm before doing anything
+
     if dst.exists():
-        print(f"Warning: output folder already exists: {dst}")
-        answer = input("Continue and overwrite? (y/n): ").strip().lower()
+        answer = input("Output folder already exists. Overwrite? (y/n): ").strip().lower()
         if answer != "y":
             print("Aborted.")
             sys.exit(0)
 
     dst.mkdir(parents=True, exist_ok=True)
-
-    print(f"Source:  {src}")
-    print(f"Output:  {dst}")
-
     translate_folder(src, dst, max_pages=max_pages)
+    actual = get_actual_usage()
+    print("\n── Done ──")
+    print(f"Actual tokens used  — input: {actual['input_tokens']:,}  output: {actual['output_tokens']:,}")
+    print(f"Actual cost         : ${actual['cost_usd']:.4f}")

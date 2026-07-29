@@ -23,6 +23,17 @@ AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
 
 _client = None
 
+# Actual token usage accumulated across all API calls in this process
+_usage = {"input_tokens": 0, "output_tokens": 0}
+
+
+def get_actual_usage() -> dict:
+    """Return cumulative token usage and estimated cost for this session."""
+    inp = _usage["input_tokens"]
+    out = _usage["output_tokens"]
+    cost = inp / 1_000_000 * 3.00 + out / 1_000_000 * 15.00
+    return {"input_tokens": inp, "output_tokens": out, "cost_usd": cost}
+
 
 def _get_client():
     global _client
@@ -51,6 +62,9 @@ def _invoke(prompt: str, max_tokens: int = 8096) -> str:
                 body=json.dumps(body),
             )
             result = json.loads(response["body"].read())
+            usage = result.get("usage", {})
+            _usage["input_tokens"] += usage.get("input_tokens", 0)
+            _usage["output_tokens"] += usage.get("output_tokens", 0)
             return result["content"][0]["text"].strip()
         except ClientError as e:
             if e.response["Error"]["Code"] == "ThrottlingException":
