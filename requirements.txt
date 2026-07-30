@@ -3,6 +3,6 @@ pymupdf-fonts
 python-docx
 docx2python
 openpyxl
-boto3
+anthropic[bedrock]
 charset-normalizer
 python-dotenv

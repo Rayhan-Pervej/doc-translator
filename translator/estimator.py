@@ -141,10 +141,11 @@ def estimate_cost(src: Path) -> None:
         print("  No Japanese content found — nothing to translate.")
         return
 
-    # Multipliers calibrated from real runs against extracted text (not raw XML).
-    # Content: JP chars × 1.4 input, × 0.68 output. Name calls: 300 in + 50 out each.
-    est_input  = int(total_jp_chars * 1.4) + name_calls * 300
-    est_output = int(total_jp_chars * 0.68) + name_calls * 50
+    # Multipliers calibrated from real run: 11,414 JP chars → 21,741 input / 11,197 output tokens.
+    # Input: 1.90x JP chars (prompt overhead + numbered list format, no cache discount applied).
+    # Output: 1.0x JP chars (index-based output — EN translation only, no JP keys repeated).
+    est_input  = int(total_jp_chars * 1.9) + name_calls * 300
+    est_output = int(total_jp_chars * 1.0) + name_calls * 50
     in_cost    = est_input  / 1_000_000 * _PRICE_INPUT_PER_M
     out_cost   = est_output / 1_000_000 * _PRICE_OUTPUT_PER_M
     total_cost = in_cost + out_cost
@@ -163,5 +164,5 @@ def estimate_cost(src: Path) -> None:
     print(f"  ─────────────────────────────────────────")
     print(f"  Estimated total cost      :  ${total_cost:.4f}  (~${total_cost*1.3:.4f} with overhead)")
     print(f"\n  Model: {os.environ.get('BEDROCK_MODEL_ID', 'us.anthropic.claude-sonnet-4-6')}")
-    print(f"  Note: Actual cost is typically within the overhead range.")
+    print(f"  Note: Multipliers calibrated from real runs. Input: 1.9x JP chars. Output: 1.0x JP chars (index-based, EN only).")
     print()
