@@ -27,24 +27,36 @@ Given a folder of Japanese documents, it produces a mirror English folder:
 
 ---
 
+## How Translation Works
+
+All Japanese strings are batched and sent to Claude via AWS Bedrock using **structured output** (Pydantic schema enforced JSON). Each API call returns a guaranteed-valid JSON array of `{index, translation}` pairs — no parsing fragility.
+
+- **Dynamic chunk sizing** — chunks are sized by estimated output token budget (6000 tokens), not a fixed string count. Short strings pack more per chunk; long strings get fewer. Hard cap of 80 strings per chunk for reliability.
+- **Index-based matching** — Claude returns a numbered index for each translation, mapped back to the original string by position. No key matching or character normalization needed — works correctly regardless of Unicode variants.
+- **Automatic retry** — if any index is missing from a chunk response after 3 attempts, those strings are retried individually. No string is ever left untranslated.
+- **Deduplication** — identical strings across a file are translated once and reused everywhere.
+
+---
+
 ## Project Structure
 
 ```
 doc-translator/
 ├── main.py                  ← entry point (run this)
 ├── requirements.txt
+├── notes.md                 ← implementation notes and TODOs
 ├── .env                     ← your AWS credentials (not committed)
 ├── .env.example             ← template
 │
 └── translator/
-    ├── client.py            ← Bedrock API client + token tracking
-    ├── common.py            ← shared helpers (Japanese detection, XML, batch translate)
+    ├── client.py            ← AnthropicBedrock SDK client, token tracking, structured output
+    ├── common.py            ← batch translation, chunk sizing, Japanese detection, XML helpers
     ├── estimator.py         ← cost estimation (no API calls)
     ├── pipeline.py          ← folder walking + file routing
     └── handlers/
         ├── txt.py           ← .txt, .md, .csv
         ├── docx.py          ← .docx
-        ├── xlsx.py          ← .xlsx
+        ├── xlsx.py          ← .xlsx (cells, drawings, sheet tabs)
         └── pdf.py           ← .pdf
 ```
 
@@ -149,15 +161,19 @@ Before any translation starts, the tool scans all files and shows a cost estimat
 
   Total Japanese characters :     21,029
   Name translation calls    :         18
-  Est. input tokens         :     34,840
-  Est. output tokens        :     15,199
+  Est. input tokens         :     45,355
+  Est. output tokens        :     21,929
 
-  Estimated total cost      :  $0.3325  (~$0.4323 with overhead)
+  Estimated total cost      :  $0.4650  (~$0.6045 with overhead)
 
   Proceed with translation? (y/n):
 ```
 
-Actual cost is printed at the end for comparison. Estimates are typically within ±5% of actual.
+Actual cost is printed at the end. Estimates are typically within ±15% of actual.
+
+Multipliers calibrated from real runs:
+- Input: `1.9 × JP chars` (includes prompt overhead, numbered list format)
+- Output: `1.0 × JP chars` (English translation only, no JP keys repeated)
 
 ---
 
