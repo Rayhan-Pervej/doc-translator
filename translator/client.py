@@ -1,5 +1,5 @@
 """
-Bedrock Claude client — API calls, retry logic, token tracking.
+Bedrock Claude client: API calls, retry logic, token tracking.
 """
 
 import os
@@ -46,10 +46,10 @@ SYSTEM_TRANSLATE_NAME = [
             "You are translating Japanese file and folder names to English for use in a file system.\n"
             "Rules:\n"
             "- Return a clean, concise English name\n"
-            "- Use the same capitalization style as the original (title → Title Case, lowercase → lowercase)\n"
+            "- Use the same capitalization style as the original (title case for titles, lowercase for lowercase)\n"
             "- Keep it short and meaningful\n"
             "- Do not use special characters except hyphens and underscores\n"
-            "- Do not add explanations — return ONLY the translated name"
+            "- Do not add explanations, return ONLY the translated name"
         ),
     }
 ]

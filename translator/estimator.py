@@ -1,5 +1,5 @@
 """
-Cost estimator — scans files and folders to predict token usage before translating.
+Cost estimator: scans files and folders to predict token usage before translating.
 Never makes any API calls.
 """
 
@@ -19,8 +19,8 @@ SUPPORTED_EXTS      = {".txt", ".md", ".csv", ".docx", ".xlsx", ".pdf"}
 def _scan_file(path: Path) -> dict:
     """
     Return how much translatable content is in one file:
-      jp_chars   — Japanese characters in content
-      name_calls — translate_name() calls inside the file (xlsx sheet tabs)
+      jp_chars: Japanese characters in content
+      name_calls: translate_name() calls inside the file (xlsx sheet tabs)
     """
     ext    = path.suffix.lower()
     result = {"jp_chars": 0, "name_calls": 0}
@@ -51,13 +51,13 @@ def _scan_file(path: Path) -> dict:
             with zipfile.ZipFile(path) as z:
                 names = z.namelist()
 
-                # sharedStrings — extract only <t> tag text content, not raw XML
+                # sharedStrings: extract only <t> tag text content, not raw XML
                 if "xl/sharedStrings.xml" in names:
                     ss = z.read("xl/sharedStrings.xml").decode("utf-8", errors="replace")
                     for t in re.findall(r'<t(?:\s[^>]*)?>([^<]*)</t>', ss):
                         result["jp_chars"] += jp_char_count(t)
 
-                # drawings — discover via .rels files (same logic as handler)
+                # drawings: discover via .rels files (same logic as handler)
                 import posixpath
                 drawing_names: set[str] = set()
                 drawing_type = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing"
@@ -74,7 +74,7 @@ def _scan_file(path: Path) -> dict:
                     for t in re.findall(r'<\w+:t(?:\s[^>]*)?>([^<]*)</\w+:t>', xml):
                         result["jp_chars"] += jp_char_count(t)
 
-                # worksheets — extract inline strings and cached formula string values
+                # worksheets: extract inline strings and cached formula string values
                 for n in names:
                     if n.startswith("xl/worksheets/") and n.endswith(".xml"):
                         xml = z.read(n).decode("utf-8", errors="replace")
@@ -97,7 +97,7 @@ def _scan_file(path: Path) -> dict:
             doc.close()
 
     except Exception:
-        pass  # if a file can't be read, just skip it — don't crash the whole estimate
+        pass  # if a file can't be read, skip it and don't crash the whole estimate
     return result
 
 
@@ -113,7 +113,7 @@ def estimate_cost(src: Path) -> None:
     # count how many translate_name() calls will be made (folders + file stems + sheet tabs)
     name_calls = 0
     if src.is_dir():
-        seen: set[str] = set()  # deduplicate — same folder name appearing in multiple places costs only one call
+        seen: set[str] = set()  # deduplicate: same folder name in multiple places costs only one call
         for dirpath, dirnames, filenames in os.walk(src):
             for d in dirnames:
                 if has_japanese(d) and d not in seen:
@@ -138,12 +138,12 @@ def estimate_cost(src: Path) -> None:
             total_jp_chars += info["jp_chars"]
 
     if not file_breakdown and name_calls == 0:
-        print("  No Japanese content found — nothing to translate.")
+        print("  No Japanese content found, nothing to translate.")
         return
 
-    # Multipliers calibrated from real run: 11,414 JP chars → 21,741 input / 11,197 output tokens.
+    # Multipliers calibrated from real run: 11,414 JP chars produced 21,741 input / 11,197 output tokens.
     # Input: 1.90x JP chars (prompt overhead + numbered list format, no cache discount applied).
-    # Output: 1.0x JP chars (index-based output — EN translation only, no JP keys repeated).
+    # Output: 1.0x JP chars (index-based output, EN translation only, no JP keys repeated).
     est_input  = int(total_jp_chars * 1.9) + name_calls * 300
     est_output = int(total_jp_chars * 1.0) + name_calls * 50
     in_cost    = est_input  / 1_000_000 * _PRICE_INPUT_PER_M

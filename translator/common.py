@@ -33,7 +33,7 @@ def xml_unescape(s: str) -> str:
 
 def _estimate_output_tokens(s: str) -> int:
     """Estimate output tokens for one {index, translation} entry.
-    Index is tiny (~2 tokens). Translation is EN output only — no JP string returned.
+    Index is tiny (~2 tokens). Translation is EN output only, no JP string returned.
     EN translation estimated at ~0.7x JP char count at ~0.4 tokens/char.
     Add ~15 tokens for JSON object punctuation.
     """
@@ -72,9 +72,9 @@ def _restore(v: str, orig: str) -> str:
     return v
 
 
-# Index-based structured output — Claude returns {index, translation} pairs.
-# No original string returned → no key matching, no character normalization issues.
-# We map back to chunk[index-1] by position — works regardless of what Claude does to text.
+# Index-based structured output: Claude returns {index, translation} pairs.
+# No original string returned, no key matching, no character normalization issues.
+# We map back to chunk[index-1] by position, works regardless of what Claude does to text.
 class _Entry(BaseModel):
     index:       int
     translation: str
@@ -94,7 +94,7 @@ def _translate_chunk(chunk: list[str], context: str) -> dict[str, str]:
         f"- Translate ONLY Japanese text. Leave English, numbers, symbols unchanged.\n"
         f"- Do NOT add notes or explanations.\n"
         f"- Every index must appear in the output.\n\n"
-        f"Example — if input is:\n"
+        f"Example - if input is:\n"
         f"1. 売上高\n"
         f"2. 合計\n"
         f'Output: {{"translations": [{{"index": 1, "translation": "Revenue"}}, '
@@ -105,7 +105,7 @@ def _translate_chunk(chunk: list[str], context: str) -> dict[str, str]:
 
     print(f"    [debug] sending {len(chunk)} strings, first 3: {chunk[:3]}")
 
-    best: dict[int, str] = {}  # index → translation
+    best: dict[int, str] = {}  # index to translation
 
     for attempt in range(3):
         parsed = translate_structured(prompt, _Translations)
@@ -135,7 +135,7 @@ def _translate_chunk(chunk: list[str], context: str) -> dict[str, str]:
 
 
 def _translate_single(text: str, context: str) -> str:
-    """Translate one string individually — fallback for strings dropped by chunk translate."""
+    """Translate one string individually. Fallback for strings dropped by chunk translate."""
     prompt = (
         f"Translate the following Japanese text to natural, professional English.\n"
         f"Rules:\n"
@@ -164,7 +164,7 @@ def batch_translate(texts: list[str], context: str) -> dict[str, str]:
             print(f"    [retry] {len(missing)} string(s) missing from chunk {chunk_num}, retrying individually:")
             for s in missing:
                 preview = s[:60].replace("\n", "\\n")
-                print(f"      → {preview!r}")
+                print(f"      - {preview!r}")
                 result[s] = _translate_single(s, context)
 
     return result

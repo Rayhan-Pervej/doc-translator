@@ -44,7 +44,7 @@ def _translate_shared_strings(xml_bytes: bytes, context: str) -> bytes:
     for m in matches:
         inner = m.group(1)
         if run_pat.findall(inner):
-            # Rich text: multiple <r> runs — join all <t> values to form the full string
+            # Rich text: multiple <r> runs, join all <t> values to form the full string
             all_t = plain_t.findall(inner)
             raw   = "".join(all_t)
             entries.append((m, True, raw, xml_unescape(raw)))
@@ -77,7 +77,7 @@ def _translate_shared_strings(xml_bytes: bytes, context: str) -> bytes:
             for i, tp in enumerate(reversed(t_positions)):
                 new_text  = translated if i == len(t_positions) - 1 else ""
                 new_inner = new_inner[:tp.start(1)] + new_text + new_inner[tp.end(1):]
-            # Strip phonetic ruby annotations — they're Japanese-specific and meaningless after translation
+            # Strip phonetic ruby annotations: Japanese-specific and meaningless after translation
             new_inner = re.sub(r'<rPh\b[^>]*>.*?</rPh>', '', new_inner, flags=re.DOTALL)
             new_inner = re.sub(r'<phoneticPr\b[^>]*/>', '', new_inner)
         else:
@@ -119,8 +119,8 @@ def _translate_sheet_xml(xml_bytes: bytes, context: str) -> bytes:
 
 def _translate_workbook_xml(xml_bytes: bytes, context: str) -> tuple[bytes, dict[str, str]]:
     text  = xml_bytes.decode("utf-8")
-    # Unescape &quot; etc. in tab names before processing — a name like
-    # 4."Input" would be stored as 4.&quot;Input&quot; in the XML attribute
+    # Unescape &quot; etc. in tab names before processing.
+    # A name like 4."Input" would be stored as 4.&quot;Input&quot; in the XML attribute
     names     = [(p, xml_unescape(n), s) for p, n, s in re.findall(r'(<sheet\b[^>]*\bname=")([^"]+)(")', text)]
     jp_names  = [n for _, n, _ in names if has_japanese(n)]
     if not jp_names:
@@ -206,7 +206,7 @@ def _find_drawing_paths(all_items: list[tuple]) -> set[str]:
             for target in re.findall(
                 rf'Type="{re.escape(rels_drawing_type)}"[^>]*Target="([^"]+)"', rels_xml
             ):
-                # Target is relative to xl/worksheets/ — resolve to full path
+                # Target is relative to xl/worksheets/, resolve to full path
                 base = "xl/worksheets/"
                 full = posixpath.normpath(posixpath.join(base, target)).lstrip("/")
                 drawing_paths.add(full)
@@ -250,7 +250,7 @@ def translate_xlsx(src: Path, dst: Path, context: str):
                 data  = orig_data
 
                 if fname == "xl/calcChain.xml":
-                    # Drop calcChain — it caches formula evaluation order by cell address,
+                    # Drop calcChain: it caches formula evaluation order by cell address,
                     # which becomes stale after we rewrite shared strings. Excel rebuilds it on open.
                     continue
 
