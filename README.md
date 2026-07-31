@@ -24,6 +24,22 @@ Given a folder of Japanese documents, it produces a mirror English folder:
 - File names → translated to English
 - File contents → translated to English (formatting preserved)
 - Cost is estimated before any API calls are made — you confirm before spending
+- All file types use batch translation with structured output — strings are deduplicated, chunked, validated, and retried automatically
+
+---
+
+## How Translation Works
+
+All content handlers (pdf, docx, csv, txt, xlsx) use the same `batch_translate()` pipeline:
+
+1. **Collect** — extract all unique Japanese strings from the file
+2. **Chunk** — split into groups sized by output token budget (≤6000 tokens, ≤80 strings per chunk)
+3. **Translate** — send each chunk to Claude with a structured output schema (`{index, translation}` pairs)
+4. **Validate** — verify every index is returned; retry missing entries up to 3 times
+5. **Fall back** — if a chunk still has gaps, retry missing strings individually
+6. **Apply** — map translations back to the original document structure
+
+Index-based structured output (`{index, translation}`) avoids Unicode normalization mismatches that break key-matching approaches.
 
 ---
 
@@ -37,15 +53,15 @@ doc-translator/
 ├── .env.example             ← template
 │
 └── translator/
-    ├── client.py            ← Bedrock API client + token tracking
-    ├── common.py            ← shared helpers (Japanese detection, XML, batch translate)
+    ├── client.py            ← AnthropicBedrock SDK client + token tracking
+    ├── common.py            ← batch_translate(), chunking, structured output, helpers
     ├── estimator.py         ← cost estimation (no API calls)
     ├── pipeline.py          ← folder walking + file routing
     └── handlers/
         ├── txt.py           ← .txt, .md, .csv
         ├── docx.py          ← .docx
         ├── xlsx.py          ← .xlsx
-        └── pdf.py           ← .pdf
+        └── pdf.py           ← .pdf (text replaced in-place, layout preserved)
 ```
 
 ---
@@ -105,7 +121,7 @@ AWS_REGION=us-east-1
 BEDROCK_MODEL_ID=us.anthropic.claude-sonnet-4-6
 ```
 
-> If you already have AWS configured via `aws configure`, leave the key lines blank — the tool will use your AWS profile automatically.
+> If you already have AWS configured via `aws configure`, leave the key fields blank — the tool will use your AWS profile automatically.
 
 ---
 
@@ -149,15 +165,18 @@ Before any translation starts, the tool scans all files and shows a cost estimat
 
   Total Japanese characters :     21,029
   Name translation calls    :         18
-  Est. input tokens         :     34,840
-  Est. output tokens        :     15,199
+  Est. input tokens         :     29,441
+  Est. output tokens        :     14,300
 
-  Estimated total cost      :  $0.3325  (~$0.4323 with overhead)
+  Input cost  ($3.00/M tokens) : $0.0883
+  Output cost ($15.00/M tokens) : $0.2145
+  ─────────────────────────────────────────
+  Estimated total cost      :  $0.3028  (~$0.3937 with overhead)
 
   Proceed with translation? (y/n):
 ```
 
-Actual cost is printed at the end for comparison. Estimates are typically within ±5% of actual.
+Actual cost is printed at the end for comparison. Estimates are typically within ±15% of actual.
 
 ---
 
@@ -169,8 +188,8 @@ Actual cost is printed at the end for comparison. Estimates are typically within
 | `.pdf` | All text, replaced in-place (layout preserved) |
 | `.docx` | Paragraphs and table cells |
 | `.csv` | All cell values |
-| `.txt` | Full file content |
-| `.md` | Full file content |
+| `.txt` | Full file content (line by line) |
+| `.md` | Full file content (line by line) |
 | Other | Copied as-is |
 
 ---
