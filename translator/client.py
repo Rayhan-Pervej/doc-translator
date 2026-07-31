@@ -1,5 +1,5 @@
 """
-Bedrock Claude client — API calls, retry logic, token tracking.
+Bedrock Claude client: API calls, retry logic, token tracking.
 """
 
 import json
@@ -103,7 +103,7 @@ Rules:
 - Use the same capitalization style as the original (if it looks like a title, use Title Case; if lowercase, use lowercase)
 - Keep it short and meaningful
 - Do not use special characters except hyphens and underscores
-- Do not add explanations — return ONLY the translated name
+- Do not add explanations, return ONLY the translated name
 
 Japanese name: {name}"""
     return _invoke(prompt, max_tokens=200).strip('"\'')

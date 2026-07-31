@@ -45,9 +45,9 @@ def xml_unescape(s: str) -> str:
 
 
 def _estimate_output_tokens(s: str) -> int:
-    """Estimate output tokens for one string's English translation — used by _build_chunks()
-    to keep each chunk under OUTPUT_TOKEN_BUDGET before sending to the API. Never makes an
-    API call. JP chars expand to ~0.7 English words, each word ~0.4 tokens, +15 overhead."""
+    """Estimate output tokens for one string's English translation.
+    Used by _build_chunks() to keep each chunk under OUTPUT_TOKEN_BUDGET before sending to the API.
+    Never makes an API call. JP chars expand to ~0.7 English words, each word ~0.4 tokens, +15 overhead."""
     jp   = sum(1 for c in s if 0x3000 <= ord(c) <= 0x9FFF or 0xF900 <= ord(c) <= 0xFAFF)
     rest = len(s) - jp
     return int((jp * 0.7 + rest) * 0.4) + 15
@@ -95,7 +95,7 @@ def _translate_chunk(chunk: list[str], context: str) -> dict[str, str]:
         f"You are translating: {context}\n\n"
         f"Translate the following {n} Japanese texts to English.\n"
         f"Return ONLY a JSON array with EXACTLY {n} strings in the same order.\n"
-        f"No extra text, no explanation, no markdown — just the array.\n\n"
+        f"No extra text, no explanation, no markdown. Just the array.\n\n"
         f"{numbered}"
     )
 
@@ -119,7 +119,7 @@ def _translate_chunk(chunk: list[str], context: str) -> dict[str, str]:
         else:
             print(f"    [warn] invalid/empty response on attempt {attempt+1}/3, retrying...")
 
-    # partial best result — map what we have, leave the rest for individual fallback
+    # partial best result: map what we have, leave the rest for individual fallback
     result: dict[str, str] = {}
     if best:
         for i in range(min(len(best), n)):
@@ -143,7 +143,7 @@ def batch_translate(texts: list[str], context: str) -> dict[str, str]:
         return {}
 
     chunks = _build_chunks(unique)
-    print(f"  [batch] {len(unique)} unique strings → {len(chunks)} chunk(s)")
+    print(f"  [batch] {len(unique)} unique strings, {len(chunks)} chunk(s)")
 
     result: dict[str, str] = {}
     for chunk_num, chunk in enumerate(chunks, 1):
@@ -154,7 +154,7 @@ def batch_translate(texts: list[str], context: str) -> dict[str, str]:
         if missing:
             print(f"    [retry] {len(missing)} string(s) missing from chunk {chunk_num}, retrying individually:")
             for s in missing:
-                print(f"      → {s[:60]}")
+                print(f"      - {s[:60]}")
                 result[s] = _translate_single(s, context)
 
     return result

@@ -1,5 +1,5 @@
 """
-Translation pipeline — walks folders, routes files, reports errors.
+Translation pipeline: walks folders, routes files, reports errors.
 """
 
 import os
@@ -21,7 +21,7 @@ def process_file(src: Path, dst: Path, context: str, max_pages: int = None):
         else:
             handler(src, dst, context)
     else:
-        # unsupported format — copy as-is so the output folder is still complete
+        # unsupported format: copy as-is so the output folder is still complete
         print(f"  Copying (unsupported format): {src.name}")
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dst)
@@ -39,7 +39,7 @@ def translate_folder(src_root: Path, dst_root: Path, max_pages: int = None):
             print(f"  Folder: {dirname}")
             translated = translate_name(dirname, context=f"subfolder of {Path(dirpath).name}")
             folder_name_map[original] = translated
-            print(f"    → {translated}")
+            print(f"    translated: {translated}")
 
     # Phase 2: walk again and translate file contents, using the folder name map
     # built in phase 1 to reconstruct translated output paths.
@@ -70,7 +70,7 @@ def translate_folder(src_root: Path, dst_root: Path, max_pages: int = None):
             print(f"\nFile: {src_dir.relative_to(src_root) / filename}")
             translated_stem     = translate_name(stem, context=f"file in folder: {folder_context}")
             translated_filename = translated_stem + ext
-            print(f"  Name → {translated_filename}")
+            print(f"  Name: {translated_filename}")
 
             dst_file = dst_dir / translated_filename
             context  = f"Document '{translated_filename}' in folder '{folder_context}'"
