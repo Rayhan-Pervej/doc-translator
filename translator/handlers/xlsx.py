@@ -6,6 +6,9 @@ from ..common import has_japanese, jp_char_count, xml_escape, xml_unescape, batc
 from ..client import translate_name
 
 
+_SP_PAT = re.compile(r'(<\w+:sp\b[^>]*>)(.*?)(</\w+:sp>)', re.DOTALL)
+
+
 def _translate_drawing_xml(xml_bytes: bytes, context: str) -> bytes:
     text  = xml_bytes.decode("utf-8")
     t_pat = re.compile(r'(<\w+:t(?:\s[^>]*)?>)([^<]*)(</\w+:t>)')
@@ -14,6 +17,7 @@ def _translate_drawing_xml(xml_bytes: bytes, context: str) -> bytes:
         xml_unescape(m[1]) for m in t_pat.findall(text)
         if m[1].strip() and has_japanese(xml_unescape(m[1]))
     ))
+    tmap: dict[str, str] = {}
     if unique:
         tmap = batch_translate(unique, context)
         def replace_t(m):
@@ -22,12 +26,23 @@ def _translate_drawing_xml(xml_bytes: bytes, context: str) -> bytes:
             return m.group(1) + xml_escape(xlated) + m.group(3)
         text = t_pat.sub(replace_t, text)
 
-    # Switch all fonts to Arial so translated text renders correctly (Japanese fonts lack Latin glyphs)
-    text = re.sub(r'(<\w+:latin\b[^>]*\btypeface=")[^"]*(")', r'\1Arial\2', text)
-    text = re.sub(r'(<\w+:ea\b[^>]*\btypeface=")[^"]*(")',    r'\1Arial\2', text)
-    text = re.sub(r'(<\w+:cs\b[^>]*\btypeface=")[^"]*(")',    r'\1Arial\2', text)
-    # noAutofit freezes the text box size; normAutofit lets it resize after translation
-    text = re.sub(r'<(\w+:)noAutofit/>',                       r'<\1normAutofit/>', text)
+    if not tmap:
+        return text.encode("utf-8")
+
+    # Only fix fonts and autofit in shapes that had Japanese text translated.
+    # Shapes with no Japanese keep their original fonts.
+    def _fix_shape(m: re.Match) -> str:
+        body = m.group(2)
+        texts = [xml_unescape(t[1]) for t in t_pat.findall(body)]
+        if not any(orig in tmap for orig in texts):
+            return m.group(0)
+        body = re.sub(r'(<\w+:latin\b[^>]*\btypeface=")[^"]*(")', r'\1Arial\2', body)
+        body = re.sub(r'(<\w+:ea\b[^>]*\btypeface=")[^"]*(")',    r'\1Arial\2', body)
+        body = re.sub(r'(<\w+:cs\b[^>]*\btypeface=")[^"]*(")',    r'\1Arial\2', body)
+        body = re.sub(r'<(\w+:)noAutofit/>',                       r'<\1normAutofit/>', body)
+        return m.group(1) + body + m.group(3)
+
+    text = _SP_PAT.sub(_fix_shape, text)
     return text.encode("utf-8")
 
 
@@ -69,26 +84,30 @@ def _translate_shared_strings(xml_bytes: bytes, context: str) -> bytes:
         start, end = m.start(), m.end()
 
         if is_rich:
-            t_positions = list(plain_t.finditer(inner))
-            if not t_positions:
+            runs = list(run_pat.finditer(inner))
+            if not runs:
                 continue
-            new_inner = inner
-            # Put the full translation in the last <t>, clear the rest to avoid duplicate text
-            for i, tp in enumerate(reversed(t_positions)):
-                new_text  = translated if i == len(t_positions) - 1 else ""
-                new_inner = new_inner[:tp.start(1)] + new_text + new_inner[tp.end(1):]
-            # Strip phonetic ruby annotations: Japanese-specific and meaningless after translation
-            new_inner = re.sub(r'<rPh\b[^>]*>.*?</rPh>', '', new_inner, flags=re.DOTALL)
-            new_inner = re.sub(r'<phoneticPr\b[^>]*/>', '', new_inner)
+            # Keep only the last run with the full translation; drop all preceding runs.
+            # Empty runs with <rPr> formatting left behind cause Excel's "String properties" repair error.
+            last_run = runs[-1]
+            last_run_inner = last_run.group(1)
+            tp = plain_t.search(last_run_inner)
+            if not tp:
+                continue
+            new_last_inner = last_run_inner[:tp.start(1)] + translated + last_run_inner[tp.end(1):]
+            new_inner = inner[:runs[0].start()] + f"<r>{new_last_inner}</r>" + inner[last_run.end():]
         else:
-            tp        = plain_t.search(inner)
+            tp = plain_t.search(inner)
             if not tp:
                 continue
             new_inner = inner[:tp.start(1)] + translated + inner[tp.end(1):]
-            new_inner = re.sub(r'<rPh\b[^>]*>.*?</rPh>', '', new_inner, flags=re.DOTALL)
-            new_inner = re.sub(r'<phoneticPr\b[^>]*/>', '', new_inner)  # remove Japanese phonetic guide
 
         result = result[:start] + f"<si>{new_inner}</si>" + result[end:]
+
+    # Strip phonetic ruby annotations from ALL entries — Japanese-specific, meaningless in English output.
+    # Done after the translation loop so it covers both translated and untranslated entries.
+    result = re.sub(r'<rPh\b[^>]*>.*?</rPh>', '', result, flags=re.DOTALL)
+    result = re.sub(r'<phoneticPr\b[^>]*/>', '', result)
 
     return result.encode("utf-8")
 
@@ -166,16 +185,38 @@ def _patch_formula_sheet_refs(xml_bytes: bytes, sheet_name_map: dict[str, str]) 
     return text.encode("utf-8")
 
 
+_JP_FONT_NAMES = re.compile(
+    r'[　-鿿豈-﫿'   # CJK / fullwidth chars in the font name
+    r'|Meiryo|MS\s*Gothic|MS\s*Mincho|Yu\s*Gothic|Yu\s*Mincho'
+    r'|ＭＳ|メイリオ|游|宋体|SimSun|NSimSun|FangSong|KaiTi|MingLiU'
+    r']',
+    re.IGNORECASE,
+)
+
+
 def _set_fonts_arial_styles(xml_bytes: bytes) -> bytes:
     text = xml_bytes.decode("utf-8")
-    text = re.sub(r'(<name\b[^>]*\bval=")[^"]*(")',   r'\1Arial\2', text)
-    text = re.sub(r'(<scheme\b[^>]*\bval=")[^"]*(")', r'\1none\2',  text)
+
+    def _fix_font_block(m: re.Match) -> str:
+        block = m.group(0)
+        name_m = re.search(r'<name\b[^>]*\bval="([^"]*)"', block)
+        if name_m and _JP_FONT_NAMES.search(name_m.group(1)):
+            block = re.sub(r'(<name\b[^>]*\bval=")[^"]*(")', r'\1Arial\2', block)
+            block = re.sub(r'(<scheme\b[^>]*\bval=")[^"]*(")', r'\1none\2', block)
+        return block
+
+    text = re.sub(r'<font>.*?</font>', _fix_font_block, text, flags=re.DOTALL)
     return text.encode("utf-8")
 
 
 def _set_fonts_arial_shared_strings(xml_bytes: bytes) -> bytes:
     text = xml_bytes.decode("utf-8")
-    text = re.sub(r'(<rFont\b[^>]*\bval=")[^"]*(")', r'\1Arial\2', text)
+
+    def _fix_rfont(m: re.Match) -> str:
+        val = m.group(1)
+        return f'<rFont val="Arial"/>' if _JP_FONT_NAMES.search(val) else m.group(0)
+
+    text = re.sub(r'<rFont\b[^>]*\bval="([^"]*)"[^/]*/>', _fix_rfont, text)
     return text.encode("utf-8")
 
 
@@ -261,13 +302,13 @@ def translate_xlsx(src: Path, dst: Path, context: str):
                     )
                     data = text.encode("utf-8")
 
+                elif fname == "xl/workbook.xml":
+                    data = wb_translated
+
                 elif fname == "xl/sharedStrings.xml":
                     print("    Translating shared strings...")
                     data = _translate_shared_strings(data, context)
                     data = _set_fonts_arial_shared_strings(data)
-
-                elif fname == "xl/workbook.xml":
-                    data = wb_translated
 
                 elif fname == "xl/styles.xml":
                     print("    Setting fonts to Arial in styles...")
